@@ -5,6 +5,8 @@ import math
 import os
 import re
 import sqlite3
+import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -145,9 +147,31 @@ class Agent:
     def _load_semantic_index(self) -> None:
         """Load offline LLM features, if precompute.py has generated them."""
         configured = os.environ.get("CLEAN_CATALOG_PATH")
-        clean_path = Path(configured) if configured else self.catalog_path.with_name("clean_catalog.jsonl")
-        if not clean_path.exists():
-            return
+        if configured:
+            clean_path = Path(configured)
+        else:
+            clean_path = self.catalog_path.with_name("catalog_attributes.jsonl")
+            if not clean_path.exists():
+                # Lazily create the flat semantic catalog on first use.  This
+                # keeps normal runs fast while allowing a raw catalog to work
+                # without a separate manual preprocessing command.
+                precompute = Path(__file__).with_name("precompute.py")
+                if precompute.exists():
+                    try:
+                        subprocess.run(
+                            [
+                                sys.executable,
+                                str(precompute),
+                                "--input", str(self.catalog_path),
+                                "--output", str(clean_path),
+                            ],
+                            check=True,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+            
         with clean_path.open(encoding="utf-8") as handle:
             for line in handle:
                 if not line.strip():
@@ -160,31 +184,23 @@ class Agent:
                 for category in _values(item.get("category")):
                     concepts.append(f"category: {category}")
                 features = item.get("features")
-                if isinstance(features, dict):
-                    for attribute, values in features.items():
-                        if attribute not in ALLOWED_ATTRIBUTES or attribute == "category":
-                            continue
-                        for value in _values(values):
-                            concepts.append(f"{attribute}: {value}")
-                else:
-                    # catalog_attributes.jsonl uses a flat schema. Translate
-                    # its field names into the same semantic concept format.
-                    flat_attributes = {
-                        "material": item.get("material", item.get("materials")),
-                        "color": item.get("color"),
-                        "size": item.get("size"),
-                        "style": item.get("style"),
-                        "brand": item.get("brand"),
-                        "budget": item.get("budget", item.get("budget_price")),
-                        "feature": item.get("feature"),
-                        "use_case": item.get("use_case"),
-                        "other": item.get("other"),
-                    }
-                    for attribute, values in flat_attributes.items():
-                        for value in _values(values):
-                            concepts.append(f"{attribute}: {value}")
-                # Preserve order and cap noisy / unusually long product records.
-                self.concepts_by_asin[parent_asin] = list(dict.fromkeys(concepts))[:MAX_DOCUMENT_CONCEPTS]
+
+                flat_attributes = {
+                    "material": item.get("material", item.get("materials")),
+                    "color": item.get("color"),
+                    "size": item.get("size"),
+                    "style": item.get("style"),
+                    "brand": item.get("brand"),
+                    "budget": item.get("budget", item.get("budget_price")),
+                    "feature": item.get("feature"),
+                    "use_case": item.get("use_case"),
+                    "other": item.get("other"),
+                }
+                for attribute, values in flat_attributes.items():
+                    for value in _values(values):
+                        concepts.append(f"{attribute}: {value}")
+            # Preserve order and cap noisy / unusually long product records.
+            self.concepts_by_asin[parent_asin] = list(dict.fromkeys(concepts))[:MAX_DOCUMENT_CONCEPTS]
 
     def _load_attribute_index(self) -> None:
         """Load the flat attribute catalog used by entropy question selection."""

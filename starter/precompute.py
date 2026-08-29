@@ -141,7 +141,7 @@ def _clean_feature_values(value: Any) -> list[str]:
 
 
 def clean_product(product: dict[str, Any], model: str, url: str, timeout: int) -> dict[str, Any]:
-    """Produce the specified clean-catalog schema for one original product."""
+    """Produce the flat catalog_attributes schema for one original product."""
     extracted = _ollama_extract(product, model, url, timeout)
     category = product.get("categories", product.get("category"))
     # Do not let the LLM rewrite the catalog category. It remains only in the
@@ -151,11 +151,25 @@ def clean_product(product: dict[str, Any], model: str, url: str, timeout: int) -
         values = _clean_feature_values(extracted.get(key))
         if values:
             features[key] = values
+    def first(key: str, default: Any = "unknown") -> Any:
+        values = features.get(key)
+        return ", ".join(values) if values else default
+
     return {
         "parent_asin": product["parent_asin"],
         "title": product.get("title"),
         "category": category,
-        "features": features,
+        "materials": first("material"),
+        "color": first("color"),
+        "size": first("size"),
+        "style": first("style"),
+        "brand": first("brand"),
+        "budget_price": first("budget"),
+        "feature": first("feature"),
+        "use_case": first("use_case"),
+        "other": first("other"),
+        "average_rating": product.get("average_rating"),
+        "rating_number": product.get("rating_number"),
     }
 
 
