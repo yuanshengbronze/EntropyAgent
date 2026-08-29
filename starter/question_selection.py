@@ -30,17 +30,21 @@ import math
 import re
 from typing import Callable, Iterable, Sequence
 
-# ``category`` and ``brand`` are excluded entirely - the deterministic
-# simulator never reveals them (spec section 1). ``other`` is handled
-# separately as the safe fallback, not scored here.
+# Every attribute the Agent API allows except ``null`` and ``other`` (the
+# wildcard fallback, scored separately). ``category`` and ``brand`` are kept in
+# the set but heavily suppressed by their answerability priors below rather than
+# excluded outright - the local simulator never answers them, but the component
+# should not hard-code that assumption about the private evaluator.
 ASKABLE_ATTRIBUTES: tuple[str, ...] = (
+    "category",
     "material",
     "color",
     "size",
     "style",
+    "brand",
+    "budget",
     "feature",
     "use_case",
-    "budget",
 )
 
 # How often the deterministic simulator can actually answer a question about
@@ -53,7 +57,7 @@ ASKABLE_ATTRIBUTES: tuple[str, ...] = (
 #   - ``classify_constraint`` routes any unrecognised phrase to ``feature``,
 #     making it a near-catch-all; ``style`` needs department/fit/sleeve/neck
 #     wording, ``size`` needs width/size wording, ``use_case`` needs an activity
-#     word - all comparatively rare.
+#     word - all comparatively rare. It has no branch for ``category``/``brand``.
 #   - ``other`` matches any undisclosed constraint (wildcard).
 # Rough values - tune against a dev sample, never the official public set.
 ANSWERABILITY_PRIOR: dict[str, float] = {
@@ -63,7 +67,9 @@ ANSWERABILITY_PRIOR: dict[str, float] = {
     "style": 0.10,
     "size": 0.05,
     "use_case": 0.02,
-    "budget": 0.01,   # appended last in intent_card; floored so cost stays finite
+    "budget": 0.01,      # appended last in intent_card; floored so cost stays finite
+    "category": 0.005,   # stated in the opening message; simulator never re-answers
+    "brand": 0.005,      # simulator has no brand branch; kept only for robustness
     "other": 0.95,
 }
 
@@ -109,14 +115,15 @@ def _price(raw: object) -> float | None:
 def normalize_attributes(row: dict) -> dict:
     """One ``catalog_attributes.jsonl`` row -> ``{attribute: [values], _price}``.
 
-    ``brand`` and ``category`` are dropped (never askable). The raw price is
-    kept under ``_price`` for on-the-fly budget bucketing.
+    The raw price is kept under ``_price`` for on-the-fly budget bucketing.
     """
     return {
+        "category": _split_values(row.get("category", row.get("categories"))),
         "material": _split_values(row.get("materials", row.get("material"))),
         "color": _split_values(row.get("color")),
         "size": _split_values(row.get("size")),
         "style": _split_values(row.get("style")),
+        "brand": _split_values(row.get("brand", row.get("store"))),
         "feature": _split_values(row.get("feature")),
         "use_case": _split_values(row.get("use_case")),
         "other": _split_values(row.get("other")),
@@ -244,19 +251,25 @@ def choose_next_question(
     omega: float = 1.0,
     priors: dict[str, float] | None = None,
     askable: Sequence[str] = ASKABLE_ATTRIBUTES,
-) -> str:
+) -> str | None:
     """Pick the attribute worth asking about next.
 
     ``pool`` is the current ranked candidate set as normalized attribute maps
     (see ``normalize_attributes``). ``exhausted`` are attributes already asked
-    or declined. Returns one of ``askable`` or ``"other"`` - the safe fallback
-    that bypasses classification and matches any undisclosed constraint.
+    or declined. For each remaining attribute: coverage-discounted multi-label
+    gain ratio, then EG2 cost weighting by ``1 / answerability_prior``.
+
+    Falls back to ``"other"`` - the wildcard that matches any undisclosed
+    constraint - when nothing scores above ``EPSILON``; or to ``None`` (ask
+    nothing this turn) once ``"other"`` itself is in ``exhausted``. Each
+    attribute is asked at most once, so late turns carry recommendations only.
     """
     priors = priors or ANSWERABILITY_PRIOR
     blocked = set(exhausted)
+    fallback = None if "other" in blocked else "other"
     candidates = [a for a in askable if a not in blocked]
     if not pool or not candidates:
-        return "other"
+        return fallback
 
     scored_pool: Sequence[dict] = pool
     if "budget" in candidates:
@@ -272,7 +285,7 @@ def choose_next_question(
         scores[attribute] = information_cost_score(gain_ratio, cost, omega)
 
     if not scores or max(scores.values()) < EPSILON:
-        return "other"
+        return fallback
     return max(scores, key=scores.get)
 
 

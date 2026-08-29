@@ -31,6 +31,10 @@ WORKED_EXAMPLE = _pool({
     "use_case": [["casual"]] * 19 + [["athletic"]],
 })
 
+ALL_ASKABLE = {
+    "category", "material", "color", "size", "style", "brand", "budget", "feature", "use_case",
+}
+
 
 class MultiLabelEntropyTest(unittest.TestCase):
     def test_matches_hand_computed_value(self) -> None:
@@ -93,8 +97,20 @@ class ChooseNextQuestionTest(unittest.TestCase):
         self.assertEqual(choose_next_question([]), "other")
 
     def test_all_attributes_exhausted_falls_back_to_other(self) -> None:
-        exhausted = {"material", "color", "size", "style", "feature", "use_case", "budget"}
-        self.assertEqual(choose_next_question(WORKED_EXAMPLE, exhausted=exhausted), "other")
+        self.assertEqual(choose_next_question(WORKED_EXAMPLE, exhausted=ALL_ASKABLE), "other")
+
+    def test_other_also_exhausted_returns_none(self) -> None:
+        self.assertIsNone(choose_next_question(WORKED_EXAMPLE, exhausted=ALL_ASKABLE | {"other"}))
+
+    def test_category_and_brand_are_suppressed_not_excluded(self) -> None:
+        # brand splits the pool 20 ways (real signal) but its answerability prior
+        # is ~0, so a modestly-informative color question still wins.
+        pool = _pool({
+            "brand": [[f"brand{i}"] for i in range(20)],
+            "color": [["blue"]] * 10 + [["red"]] * 10,
+        })
+        self.assertGreater(gain_ratio_multilabel_missing(pool, "brand"), 0.0)
+        self.assertEqual(choose_next_question(pool, askable=("brand", "color")), "color")
 
     def test_equal_priors_prefer_the_cleaner_split(self) -> None:
         pool = _pool({
@@ -113,6 +129,7 @@ class NormalizeAttributesTest(unittest.TestCase):
     def test_flat_schema_row_is_split_and_cleaned(self) -> None:
         row = {
             "parent_asin": "B07KCFS4VC",
+            "category": "clothing",
             "materials": "cotton, polyester, jersey",
             "color": "unknown",
             "size": "unknown",
@@ -124,11 +141,12 @@ class NormalizeAttributesTest(unittest.TestCase):
             "other": "department: men",
         }
         normalized = normalize_attributes(row)
+        self.assertEqual(normalized["category"], ["clothing"])
         self.assertEqual(normalized["material"], ["cotton", "polyester", "jersey"])
         self.assertEqual(normalized["color"], [])  # "unknown" dropped
         self.assertEqual(normalized["style"], ["athletic", "casual"])
+        self.assertEqual(normalized["brand"], ["columbia"])
         self.assertEqual(normalized["_price"], 27.99)
-        self.assertNotIn("brand", normalized)
         self.assertIn("department: men", normalized["other"])
 
 
