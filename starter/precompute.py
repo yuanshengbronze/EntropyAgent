@@ -19,11 +19,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
+import struct
 import sys
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+try:
+    from starter.semantic_index import concepts_for_item, file_sha256
+except ModuleNotFoundError:  # Supports `python starter/precompute.py` as documented.
+    from semantic_index import concepts_for_item, file_sha256
 
 
 # ``null`` is valid in the Agent API as the absence of an attribute, but is not
@@ -187,6 +194,104 @@ def _existing_ids(output_path: Path) -> set[str]:
         }
 
 
+def build_embedding_index(
+    input_path: Path,
+    output_path: Path,
+    model: str,
+    url: str,
+    timeout: int,
+    batch_size: int,
+) -> None:
+    """Create or resume an exact concept-vector index for runtime reranking.
+
+    The exact concept strings used by ``Agent`` are embedded once globally.
+    The SQLite file remains valid only for this source catalog and model.
+    """
+    source_hash = file_sha256(input_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(output_path)
+    connection.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS concepts (concept TEXT PRIMARY KEY, embedding BLOB, dimensions INTEGER)"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS product_concepts ("
+        "parent_asin TEXT NOT NULL, position INTEGER NOT NULL, concept TEXT NOT NULL, "
+        "PRIMARY KEY (parent_asin, position))"
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS product_concepts_asin ON product_concepts(parent_asin)")
+    metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+    expected = {"schema_version": "2", "source_sha256": source_hash, "embedding_model": model}
+    if metadata and any(metadata.get(key) != value for key, value in expected.items()):
+        connection.close()
+        raise RuntimeError(
+            f"Embedding index {output_path} was built for a different catalog or model. "
+            "Choose a new --embedding-output path."
+        )
+    if not metadata:
+        connection.executemany("INSERT INTO metadata(key, value) VALUES (?, ?)", expected.items())
+
+    indexed_products = 0
+    with input_path.open(encoding="utf-8") as source:
+        for line in source:
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            parent_asin = str(item.get("parent_asin", ""))
+            if not parent_asin:
+                continue
+            concepts = concepts_for_item(item)
+            connection.executemany(
+                "INSERT OR IGNORE INTO concepts(concept) VALUES (?)", ((concept,) for concept in concepts)
+            )
+            connection.executemany(
+                "INSERT OR IGNORE INTO product_concepts(parent_asin, position, concept) VALUES (?, ?, ?)",
+                ((parent_asin, position, concept) for position, concept in enumerate(concepts)),
+            )
+            indexed_products += 1
+            if indexed_products % 1000 == 0:
+                connection.commit()
+    connection.commit()
+
+    completed = int(connection.execute("SELECT COUNT(*) FROM concepts WHERE embedding IS NOT NULL").fetchone()[0])
+    total = int(connection.execute("SELECT COUNT(*) FROM concepts").fetchone()[0])
+    print(f"Catalog indexed: {indexed_products} products, {total} unique concepts ({completed} embedded).")
+    while True:
+        rows = connection.execute(
+            "SELECT concept FROM concepts WHERE embedding IS NULL ORDER BY concept LIMIT ?", (batch_size,)
+        ).fetchall()
+        if not rows:
+            break
+        concepts = [str(row[0]) for row in rows]
+        payload = json.dumps({"model": model, "input": concepts}).encode("utf-8")
+        request = Request(url, data=payload, headers={"Content-Type": "application/json"})
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                envelope = json.loads(response.read().decode("utf-8"))
+            vectors = envelope.get("embeddings")
+            if not isinstance(vectors, list) or len(vectors) != len(concepts):
+                raise ValueError("unexpected embedding response")
+            packed: list[tuple[bytes, int, str]] = []
+            for concept, vector in zip(concepts, vectors):
+                if not isinstance(vector, list) or not vector:
+                    raise ValueError("invalid embedding vector")
+                values = [float(value) for value in vector]
+                # Keep Python's IEEE-754 doubles exactly as parsed from the
+                # Ollama JSON response; this cache must not quantize rankings.
+                packed.append((struct.pack(f"<{len(values)}d", *values), len(values), concept))
+            connection.executemany(
+                "UPDATE concepts SET embedding = ?, dimensions = ? WHERE concept = ?", packed
+            )
+            connection.commit()
+            completed += len(concepts)
+            print(f"Embedded {completed}/{total} concepts.", flush=True)
+        except (HTTPError, URLError, OSError, TimeoutError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            connection.close()
+            raise RuntimeError(f"Embedding failed after {completed}/{total} concepts: {exc}") from exc
+    connection.close()
+    print(f"Done. Wrote semantic index to {output_path}.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create an Ollama-enriched clean product catalog.")
     parser.add_argument("--input", default="data/catalog.jsonl", help="Source catalog JSONL path.")
@@ -198,9 +303,36 @@ def main() -> None:
     parser.add_argument("--progress-every", type=int, default=25, help="Print progress every N products (0 disables it).")
     parser.add_argument("--resume", action="store_true", help="Append missing products to an existing output file.")
     parser.add_argument("--dry-run", action="store_true", help="Print one clean record without writing a file.")
+    parser.add_argument(
+        "--build-embeddings", action="store_true", help="Build/resume a persistent semantic index, then exit."
+    )
+    parser.add_argument(
+        "--embedding-input", default="data/catalog_attributes.jsonl", help="Structured catalog JSONL to embed."
+    )
+    parser.add_argument(
+        "--embedding-output", default="data/semantic_index.sqlite", help="Persistent semantic SQLite index."
+    )
+    parser.add_argument(
+        "--embedding-model", default=os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text-v2-moe")
+    )
+    parser.add_argument("--embedding-batch-size", type=int, default=96)
     args = parser.parse_args()
-    if args.limit < 0 or args.progress_every < 0 or args.timeout <= 0:
-        parser.error("--limit/progress-every must be non-negative and --timeout must be positive")
+    if args.limit < 0 or args.progress_every < 0 or args.timeout <= 0 or args.embedding_batch_size <= 0:
+        parser.error("limits must be non-negative and timeouts/batch sizes must be positive")
+
+    if args.build_embeddings:
+        embedding_input = Path(args.embedding_input)
+        if not embedding_input.exists():
+            parser.error(f"Embedding input does not exist: {embedding_input}")
+        build_embedding_index(
+            embedding_input,
+            Path(args.embedding_output),
+            args.embedding_model,
+            args.ollama_url.rstrip("/").replace("/api/generate", "/api/embed"),
+            args.timeout,
+            args.embedding_batch_size,
+        )
+        return
 
     source_path = Path(args.input)
     output_path = Path(args.output)

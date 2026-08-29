@@ -5,14 +5,17 @@ import math
 import os
 import re
 import sqlite3
+import struct
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from starter.question_selection import choose_next_question, ground_answer, normalize_attributes
+from starter.semantic_index import concepts_for_item, file_sha256
 
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
@@ -36,6 +39,20 @@ NO_PREFERENCE_RE = re.compile(
     r"\b(?:no preference|don't have (?:(?:an?|any) )?(?:additional )?preference|"
     r"do not have (?:(?:an?|any) )?(?:additional )?preference|don't care|doesn't matter|"
     r"does not matter|any (?:is fine|will do)|use your judgment)\b",
+    re.IGNORECASE,
+)
+OVERRIDE_RE = re.compile(
+    r"\b(?:please\s+)?ignore\s+(?:my\s+|the\s+)?(?:earlier|previous|prior)\s+"
+    r"(?:preference|requirement|constraint)s?\b",
+    re.IGNORECASE,
+)
+OVERRIDE_VALUE_RE = re.compile(
+    r"\b(?:what\s+i\s+need\s+is|what\s+i\s+want\s+is|instead\s+i\s+"
+    r"(?:need|want)|i\s+(?:need|want)\s+instead)\s*[:,-]?\s*(.+)$",
+    re.IGNORECASE,
+)
+OPENING_CATEGORY_RE = re.compile(
+    r"\bi['’]?m\s+looking\s+for\s+(.+?)(?:[.!?]|,\s*(?:but|and)\b)",
     re.IGNORECASE,
 )
 
@@ -99,9 +116,10 @@ class Agent:
 
     def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
         self.catalog_path = Path(catalog_path)
-        self.connection = sqlite3.connect(":memory:")
         self._sessions: dict[str, dict] = {}
         self.concepts_by_asin: dict[str, list[str]] = {}
+        self._semantic_loaded_asins: set[str] = set()
+        self._semantic_connection: sqlite3.Connection | None = None
         self.embedding_cache: dict[str, list[float]] = {}
         self.ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
         self.llm_model = os.environ.get("OLLAMA_MODEL", "llama3.2:3b")
@@ -111,12 +129,54 @@ class Agent:
         self._embedding_available = self._llm_available
         self.entropy_omega = float(os.environ.get("ENTROPY_OMEGA", "1.0"))
         self.attributes_by_asin: dict[str, dict] = {}
-        self._build_index()
+        self.connection = self._open_search_index()
         self._load_semantic_index()
         self._load_attribute_index()
 
-    def _build_index(self) -> None:
-        cursor = self.connection.cursor()
+    def _open_search_index(self) -> sqlite3.Connection:
+        """Open a catalog-fingerprinted FTS cache, building it only once."""
+        configured = os.environ.get("CATALOG_FTS_PATH")
+        cache_path = Path(configured) if configured else self.catalog_path.with_name("catalog_fts.sqlite")
+        fingerprint = file_sha256(self.catalog_path)
+        if cache_path.exists():
+            try:
+                cached = sqlite3.connect(f"file:{cache_path.resolve()}?mode=ro", uri=True)
+                metadata = dict(cached.execute("SELECT key, value FROM metadata"))
+                if metadata.get("schema_version") == "1" and metadata.get("source_sha256") == fingerprint:
+                    return cached
+                cached.close()
+            except (OSError, sqlite3.DatabaseError):
+                pass
+
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f"{cache_path.stem}.", suffix=".building", dir=cache_path.parent
+            )
+            os.close(descriptor)
+            temporary_path = Path(temporary_name)
+            building = sqlite3.connect(temporary_path)
+            try:
+                self._build_index(building)
+                building.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                building.executemany(
+                    "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                    (("schema_version", "1"), ("source_sha256", fingerprint)),
+                )
+                building.commit()
+            finally:
+                building.close()
+            os.replace(temporary_path, cache_path)
+            return sqlite3.connect(f"file:{cache_path.resolve()}?mode=ro", uri=True)
+        except (OSError, sqlite3.DatabaseError):
+            # Generated caches are an optimization only. The original in-memory
+            # path preserves correctness when a deployment is read-only.
+            connection = sqlite3.connect(":memory:")
+            self._build_index(connection)
+            return connection
+
+    def _build_index(self, connection: sqlite3.Connection) -> None:
+        cursor = connection.cursor()
         cursor.execute(
             "CREATE VIRTUAL TABLE products USING fts5("
             "parent_asin UNINDEXED, title, categories, features, details, store, description, "
@@ -142,7 +202,7 @@ class Agent:
                     batch.clear()
         if batch:
             cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
-        self.connection.commit()
+        connection.commit()
 
     def _load_semantic_index(self) -> None:
         """Load offline LLM features, if precompute.py has generated them."""
@@ -172,6 +232,25 @@ class Agent:
                     except (OSError, subprocess.SubprocessError):
                         pass
             
+        semantic_path = Path(os.environ.get("SEMANTIC_INDEX_PATH", clean_path.with_name("semantic_index.sqlite")))
+        if semantic_path.exists():
+            try:
+                connection = sqlite3.connect(f"file:{semantic_path.resolve()}?mode=ro", uri=True)
+                metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+                valid = (
+                    metadata.get("schema_version") == "2"
+                    and metadata.get("source_sha256") == file_sha256(clean_path)
+                    and metadata.get("embedding_model") == self.embedding_model
+                )
+                if valid:
+                    self._semantic_connection = connection
+                    return
+                connection.close()
+            except (OSError, sqlite3.DatabaseError):
+                # A missing/incompatible generated cache must never change
+                # retrieval correctness; use the original dynamic path instead.
+                pass
+
         with clean_path.open(encoding="utf-8") as handle:
             for line in handle:
                 if not line.strip():
@@ -180,27 +259,44 @@ class Agent:
                 parent_asin = str(item.get("parent_asin", ""))
                 if not parent_asin:
                     continue
-                concepts: list[str] = []
-                for category in _values(item.get("category")):
-                    concepts.append(f"category: {category}")
-                features = item.get("features")
+                # Preserve order and cap noisy / unusually long product records.
+                self.concepts_by_asin[parent_asin] = concepts_for_item(item)
+                self._semantic_loaded_asins.add(parent_asin)
 
-                flat_attributes = {
-                    "material": item.get("material", item.get("materials")),
-                    "color": item.get("color"),
-                    "size": item.get("size"),
-                    "style": item.get("style"),
-                    "brand": item.get("brand"),
-                    "budget": item.get("budget", item.get("budget_price")),
-                    "feature": item.get("feature"),
-                    "use_case": item.get("use_case"),
-                    "other": item.get("other"),
-                }
-                for attribute, values in flat_attributes.items():
-                    for value in _values(values):
-                        concepts.append(f"{attribute}: {value}")
-            # Preserve order and cap noisy / unusually long product records.
-            self.concepts_by_asin[parent_asin] = list(dict.fromkeys(concepts))[:MAX_DOCUMENT_CONCEPTS]
+    def _ensure_candidate_concepts(self, rows: list[tuple[str, float]]) -> None:
+        """Load only current-candidate concepts from the persisted index."""
+        if self._semantic_connection is None:
+            return
+        missing = [parent_asin for parent_asin, _ in rows if parent_asin not in self._semantic_loaded_asins]
+        if not missing:
+            return
+        placeholders = ", ".join("?" for _ in missing)
+        found: dict[str, list[str]] = {parent_asin: [] for parent_asin in missing}
+        cursor = self._semantic_connection.execute(
+            "SELECT parent_asin, concept FROM product_concepts "
+            f"WHERE parent_asin IN ({placeholders}) ORDER BY parent_asin, position",
+            missing,
+        )
+        for parent_asin, concept in cursor:
+            found[str(parent_asin)].append(str(concept))
+        self.concepts_by_asin.update(found)
+        self._semantic_loaded_asins.update(missing)
+
+    def _load_persisted_embeddings(self, texts: list[str]) -> None:
+        if self._semantic_connection is None:
+            return
+        missing = list(dict.fromkeys(text for text in texts if text not in self.embedding_cache))
+        if not missing:
+            return
+        placeholders = ", ".join("?" for _ in missing)
+        cursor = self._semantic_connection.execute(
+            f"SELECT concept, embedding, dimensions FROM concepts WHERE concept IN ({placeholders}) AND embedding IS NOT NULL",
+            missing,
+        )
+        for concept, blob, dimensions in cursor:
+            count = int(dimensions)
+            if isinstance(blob, bytes) and len(blob) == 8 * count:
+                self.embedding_cache[str(concept)] = list(struct.unpack(f"<{count}d", blob))
 
     def _load_attribute_index(self) -> None:
         """Load the flat attribute catalog used by entropy question selection."""
@@ -247,10 +343,13 @@ class Agent:
             return None, {"prompt_tokens": 0, "completion_tokens": 0}
 
     def _embed(self, texts: list[str]) -> dict[str, list[float]] | None:
-        """Embed only uncached candidate concepts using Ollama's CPU endpoint."""
-        if not self._embedding_available:
-            return None
+        """Resolve persisted vectors first, embedding only genuinely new text."""
+        self._load_persisted_embeddings(texts)
         missing = list(dict.fromkeys(text for text in texts if text not in self.embedding_cache))
+        if not missing:
+            return {text: self.embedding_cache[text] for text in texts if text in self.embedding_cache}
+        if not self._embedding_available:
+            return {text: self.embedding_cache[text] for text in texts if text in self.embedding_cache}
         try:
             for start in range(0, len(missing), EMBED_BATCH_SIZE):
                 batch = missing[start:start + EMBED_BATCH_SIZE]
@@ -361,7 +460,7 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}
         ]
         if not pool:
             return
-        embed_fn = self._embed if self._embedding_available else None
+        embed_fn = self._embed if self._embedding_available or self._semantic_connection is not None else None
         grounded = ground_answer(answer, attribute, pool, embed_fn=embed_fn)
         for slot, values in grounded.items():
             session["confirmed"].setdefault(slot, set()).update(values)
@@ -413,10 +512,72 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}
             return matched
         return matched + conflicting  # soft: matches first, order otherwise stable
 
+    @staticmethod
+    def _refresh_active_terms(session: dict) -> None:
+        """Rebuild the bounded FTS query state from active message groups."""
+        terms: list[str] = []
+        seen: set[str] = set()
+        messages: list[str] = []
+        for group in session["term_groups"]:
+            if not group["active"]:
+                continue
+            messages.append(group["text"])
+            for term in group["terms"]:
+                if term not in seen and len(terms) < 40:
+                    seen.add(term)
+                    terms.append(term)
+        session["active_terms"] = terms
+        session["active_messages"] = messages
+
+    def _record_message_terms(self, session: dict, message: str) -> None:
+        """Add a turn to retrieval state, retiring superseded preferences."""
+        is_override = bool(OVERRIDE_RE.search(message))
+        if is_override:
+            # Keep the category disclosed in the opening turn, but make all
+            # earlier preferences inactive before recording the replacement.
+            for group in session["term_groups"]:
+                if group["kind"] == "preference" and group["active"]:
+                    group["active"] = False
+                    session["inactive_terms"].update(group["terms"])
+            value = OVERRIDE_VALUE_RE.search(message)
+            text = value.group(1) if value else message
+            terms = _terms(text)
+            session["term_groups"].append({"text": text, "terms": terms, "kind": "preference", "active": True})
+            # A term explicitly stated again is active, even if it occurred
+            # in a preference that has just been overridden.
+            session["inactive_terms"].difference_update(terms)
+        elif not session["term_groups"]:
+            # The opening message carries both the stable category and an
+            # optional preference. Preserve only the category on an override.
+            category = OPENING_CATEGORY_RE.search(message)
+            category_terms = _terms(category.group(1)) if category else []
+            all_terms = _terms(message)
+            if category_terms:
+                session["term_groups"].append(
+                    {"text": category.group(1), "terms": category_terms, "kind": "category", "active": True}
+                )
+                category_set = set(category_terms)
+                preference_terms = [term for term in all_terms if term not in category_set]
+            else:
+                preference_terms = all_terms
+            if preference_terms:
+                session["term_groups"].append(
+                    {"text": message, "terms": preference_terms, "kind": "preference", "active": True}
+                )
+        else:
+            session["term_groups"].append(
+                {"text": message, "terms": _terms(message), "kind": "preference", "active": True}
+            )
+        self._refresh_active_terms(session)
+
     def reset(self, session_id: str, user_profile: dict) -> None:
         self._sessions[session_id] = {
             "profile": user_profile,
             "messages": [],
+            "active_messages": [],
+            "active_terms": [],
+            "inactive_terms": set(),
+            "term_groups": [],
             "asked_attributes": set(),
             "no_preference_attributes": set(),
             "pending_attribute": None,
@@ -443,9 +604,8 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}
         elif pending_attribute:
             self._ground_answer(session, user_message, pending_attribute)
         session["messages"].append(user_message)
-        search_text = " ".join(session["messages"])
-        unique_terms = list(dict.fromkeys(_terms(search_text)))[:40]
-        expression = " OR ".join(f'"{term}"' for term in unique_terms)
+        self._record_message_terms(session, user_message)
+        expression = " OR ".join(f'"{term}"' for term in session["active_terms"])
         if not expression:
             rows: list[tuple[str, float]] = []
         else:
@@ -457,9 +617,10 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}
             rows = [(str(parent_asin), float(score)) for parent_asin, score in rows]
 
         usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        self._ensure_candidate_concepts(rows)
         candidate_concepts = self._candidate_concepts(rows)
         if candidate_concepts:
-            query_concepts, usage = self._select_query_concepts(session["messages"], candidate_concepts)
+            query_concepts, usage = self._select_query_concepts(session["active_messages"], candidate_concepts)
             semantic_scores = self._semantic_scores(query_concepts, rows)
             if semantic_scores is not None:
                 base_scores = [-score for _, score in rows]  # SQLite BM25: lower is better.

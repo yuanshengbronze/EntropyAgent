@@ -4,6 +4,8 @@ __pycache__/
 .env
 results.json
 data/catalog.jsonl
+data/catalog_fts.sqlite
+data/semantic_index.sqlite
 data/releases/
 # Organizer-only code, private evaluation data, manifests, and build reports.
 organizer/
