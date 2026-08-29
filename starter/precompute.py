@@ -177,7 +177,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Create an Ollama-enriched clean product catalog.")
     parser.add_argument("--input", default="data/catalog.jsonl", help="Source catalog JSONL path.")
     parser.add_argument("--output", default="data/clean_catalog.jsonl", help="Clean JSONL path to create.")
-    parser.add_argument("--model", default=os.environ.get("OLLAMA_MODEL", "llama3.2:3b"))
+    parser.add_argument("--model", default=os.environ.get("OLLAMA_MODEL", "qwen2.5:0.5b"))
     parser.add_argument("--ollama-url", default=os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate"))
     parser.add_argument("--timeout", type=int, default=120, help="Seconds allowed for one Ollama call.")
     parser.add_argument("--limit", type=int, default=0, help="Process only the first N new products (0 means all).")
