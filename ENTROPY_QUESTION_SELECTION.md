@@ -12,13 +12,23 @@ system (Signal 1 ranking, state tracking, scenario handling).
 
 Each turn, the agent may attach an `ask_attribute` to its response, chosen
 from: `category, material, color, size, style, brand, budget, feature,
-use_case, other, null`. `category` and `brand` are excluded entirely (see
-main README §2 — structurally never answerable by the simulator). This
-document covers exactly one function:
+use_case, other, null`. All of these except `null` are candidates:
+`category … use_case` are scored by the function below, and `other` is the
+wildcard fallback. This document covers exactly one function:
 
 ```
-ask_attribute = choose_next_question(top_k_candidates, confirmed_slots)
+ask_attribute = choose_next_question(top_k_candidates, exhausted_slots)
 ```
+
+> **`category` and `brand` are suppressed, not excluded.**
+> `evaluator/local_evaluator.py`'s `classify_constraint` has no branch that
+> returns `category` or `brand`, so against the *local* evaluator those two
+> questions always draw "no preference" (and the category is already stated
+> in the opening message). They stay in the candidate set but with a
+> near-zero answerability prior (§4), which the cost term drives to the
+> bottom — so they are only ever asked when nothing else has any signal.
+> The component should not hard-code an assumption about a simulator the
+> private evaluation set may not share.
 
 `top_k_candidates` is Signal 1's current ranked output (e.g. top 20
 products by search score) — this function never looks at the whole
@@ -60,11 +70,11 @@ should be stated precisely rather than claimed as exact ID3 equivalence.
 turn 2, `material = cotton` already confirmed, `top_k` = 20 cotton
 candidates.
 
-| attribute | value distribution across top_k | entropy | picked? |
+| attribute | value distribution across top_k | multi-label entropy (§3.1) | picked? |
 |---|---|---|---|
-| color | 14 blue, 3 black, 3 red | 1.16 | ✅ highest |
-| style | 15 crew neck, 5 v-neck | 0.81 | |
-| use_case | 19 casual, 1 athletic | 0.29 | |
+| color | 14 blue, 3 black, 3 red | 2.10 | ✅ highest |
+| style | 15 crew neck, 5 v-neck | 1.62 | |
+| use_case | 19 casual, 1 athletic | 0.57 | |
 
 `color` wins — not because it's inherently important, but because it's
 where *this specific candidate pool* currently disagrees the most. If the
@@ -73,7 +83,7 @@ a different attribute wins instead, automatically.
 
 ---
 
-## 3. Why raw entropy breaks on the real catalog
+## 3. Two corrections we apply, and one we don't
 
 A real catalog row (`data/public_set.jsonl`-adjacent product data) looks
 like this:
@@ -89,8 +99,9 @@ like this:
 
 No dedicated `color`/`material`/`style` fields — everything must be
 extracted from free text first (see main README §2's AVE/dictionary
-extraction pipeline). Three concrete problems fall out of this, each with
-an established classical fix (no training required for any of them).
+extraction pipeline). Three concrete problems fall out of this. We apply
+the classical fix for the first two; for the third we take the known cost
+knowingly (see below).
 
 ### Problem 1 — one item, multiple values for one attribute
 
@@ -160,7 +171,9 @@ GainRatio(A)  = Gain(A) / SplitInfo(A)
 ```
 
 An attribute that splits the pool into many small, even partitions gets a
-high `SplitInfo`, dividing its raw gain back down.
+high `SplitInfo`, dividing its raw gain back down. This matters directly
+for `brand` and `feature`, which in a 20-item pool are often close to 20
+distinct values.
 
 **Why this matters more for Browsing than Buying:** Buying sessions start
 with a real disclosed constraint and narrow fast, so cardinality and
@@ -192,9 +205,9 @@ def gain_ratio_multilabel_missing(top_k, attribute):
 
 Even a high-gain-ratio attribute might be nearly unanswerable by the
 simulator (e.g. `budget` is usually buried outside the disclosed
-constraint window — see main README §2). Fold in the reverse-engineered
-answerability priors using EG2's Information Cost Function (Núñez,
-*Machine Learning*, 1991 — via survey
+constraint window; `category` / `brand` are never classified at all —
+see §1). Fold in the reverse-engineered answerability priors using EG2's
+Information Cost Function (Núñez, *Machine Learning*, 1991 — via survey
 https://www.researchgate.net/publication/261853221):
 
 ```
@@ -202,9 +215,9 @@ ICF(A) = (2^GainRatio(A) - 1) / (Cost(A) + 1)^ω
 ```
 
 ```python
-def choose_next_question(top_k, confirmed_slots, omega=1.0):
-    candidates = {"material", "color", "style", "feature", "use_case", "size", "budget"}
-    candidates -= confirmed_slots.exhausted   # drop attributes already answered/exhausted
+def choose_next_question(top_k, exhausted, omega=1.0):
+    candidates = {"category", "material", "color", "size", "style",
+                  "brand", "budget", "feature", "use_case"} - exhausted
 
     scores = {}
     for a in candidates:
@@ -213,13 +226,90 @@ def choose_next_question(top_k, confirmed_slots, omega=1.0):
         scores[a] = (2 ** gr - 1) / (cost + 1) ** omega
 
     if not scores or max(scores.values()) < EPSILON:
-        return "other"   # safe fallback — bypasses classification, matches
-                          # any undisclosed constraint
+        return None if "other" in exhausted else "other"   # wildcard, then silence
     return max(scores, key=scores.get)
 ```
 
+`exhausted` = attributes already asked, declined ("no preference"), or
+confirmed. `"other"` is the safe fallback — it bypasses classification and
+matches any undisclosed constraint; once it too is exhausted the function
+returns `None` and the agent asks nothing that turn.
+
+`category` and `brand` are in `candidates` but carry a near-zero
+answerability prior (`~0.005`), so `ICF` pushes them to the bottom unless
+nothing else has any signal. The local simulator never answers them; the
+private evaluator might, so they are suppressed rather than removed.
+
 `omega` is a free parameter controlling how strongly cost dominates gain —
-tune it against the 200 public sessions (grid search, see main README §4).
+tune it against a dev sample (grid search, see main README §4).
+
+### The final formula, consolidated
+
+For the current pool `S` (the top-k ranked candidates this turn) and a
+candidate attribute `A`, write `A(i)` for the set of values item `i` carries
+for `A`, and `V_A = ⋃_{i∈S} A(i)` for the values seen in the pool.
+
+**1. Known subset and coverage** (missing-value discount, §3.2)
+
+```
+S_A    = { i ∈ S : A(i) ≠ ∅ }
+cov(A) = |S_A| / |S|
+```
+
+**2. Multi-label entropy** over `S_A` (Clare & King, §3.1), with
+`p(v) = |{ i ∈ S_A : v ∈ A(i) }| / |S_A|`
+
+```
+H(A) = − Σ_{v ∈ V_A}  [ p(v)·log₂ p(v) + (1−p(v))·log₂(1−p(v)) ]
+       ( terms with p(v) ∈ {0, 1} contribute 0 )
+```
+
+**3. Split information** (C4.5, §3.3), multi-label adaptation: normalise each
+value count `c(v) = |{ i ∈ S_A : v ∈ A(i) }|` by the **total incidence**
+`T = Σ_{v ∈ V_A} c(v)` (not `|S_A|`, which is not a probability when values
+overlap)
+
+```
+SI(A) = − Σ_{v ∈ V_A}  (c(v)/T)·log₂(c(v)/T)
+```
+
+**4. Coverage-discounted gain ratio**
+
+```
+GR(A) = H(A) / SI(A)          ( 0 if SI(A) = 0 )
+G(A)  = GR(A) · cov(A)
+```
+
+**5. Cost-weighted score** (Núñez EG2), with `π(A)` the answerability prior
+and `cost(A) = 1 / π(A)`
+
+```
+ICF(A) = ( 2^{G(A)} − 1 ) / ( cost(A) + 1 )^ω
+```
+
+**6. Selection**
+
+```
+𝒜        = { category, material, color, size, style, brand, budget, feature, use_case }
+exhausted = asked ∪ declined(no-preference) ∪ confirmed
+A*        = argmax_{ A ∈ 𝒜 \ exhausted, G(A) > 0 }  ICF(A)
+
+ask_attribute = A*        if  ICF(A*) > ε
+              = "other"   else if  "other" ∉ exhausted   ( wildcard fallback )
+              = None      otherwise                      ( ask nothing )
+```
+
+Notes:
+
+- `budget` is not categorical — before step 2 its values are replaced by
+  log-quantile bucket labels computed across `S` (§5); with fewer than 4
+  priced items it is skipped that turn (`G(budget) = 0`).
+- `category` and `brand` stay in `𝒜` but `π(category) = π(brand) ≈ 0.005`,
+  so `ICF` all but eliminates them (§1).
+- `ω` = `ENTROPY_OMEGA` (default `1.0`); `ε` = `1e-9`.
+- Reference implementation: `starter/question_selection.py`
+  (`gain_ratio_multilabel_missing`, `information_cost_score`,
+  `choose_next_question`).
 
 ---
 
@@ -242,16 +332,18 @@ def bucket_budget(top_k, n_buckets=4):
 
 ## 6. Open items to validate empirically
 
-- Confirm `answerability_prior` values against the actual 200 public
-  sessions (run every attribute type across all sessions, log which ever
-  return non-empty responses) rather than trusting the reverse-engineered
-  code read alone.
+- Confirm the `answerability_prior` values on a dev sample — never
+  `data/public_set.jsonl`, which is the held-out test set. Current values
+  are estimated from the structure of `intent_card` / `classify_constraint`
+  in `evaluator/local_evaluator.py`; `category` / `brand` are pinned near
+  zero because that simulator has no branch for them.
 - Check whether joint (multi-attribute) entropy is worth the added
   complexity over independent per-attribute scoring — likely unnecessary
-  since only one attribute is asked per turn, but worth a quick check once
-  the real 50k-item catalog is downloaded.
-- Tune `omega` and the exhaustion/coverage thresholds via grid search once
-  Milestone 0 (baseline) is working — see main README §5 build order.
+  since only one attribute is asked per turn.
+- Tune `omega` and the exhaustion/coverage thresholds via grid search on a
+  dev sample once Milestone 0 (baseline) is working.
+- Revisit the pool size (currently top 20) and whether `category` / `brand`
+  should be scored at all once the private-set behaviour is known.
 
 ---
 

@@ -464,8 +464,8 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}
             | set(session["confirmed"])
         )
         ask_attribute = self._entropy_attribute(rows, exhausted, turn)
-        if ask_attribute is not None and ask_attribute != "other":
-            # "other" is a repeatable wildcard, not a slot to exhaust.
+        if ask_attribute is not None:
+            # Every attribute - "other" included - is asked at most once.
             session["asked_attributes"].add(ask_attribute)
         session["pending_attribute"] = ask_attribute
         recommendations = [{"parent_asin": parent_asin} for parent_asin, _ in rows[:top_k]]
