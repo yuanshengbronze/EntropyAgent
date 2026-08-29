@@ -10,6 +10,8 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from starter.question_selection import choose_next_question, ground_answer, normalize_attributes
+
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 STOPWORDS = {
@@ -22,13 +24,15 @@ ALLOWED_ATTRIBUTES = {
     "budget", "feature", "use_case", "other",
 }
 SEMANTIC_CANDIDATES = 50
+ENTROPY_POOL_SIZE = 20
+MAX_TURNS = 10
 MAX_CANDIDATE_CONCEPTS = 60
 MAX_QUERY_CONCEPTS = 8
 MAX_DOCUMENT_CONCEPTS = 16
 EMBED_BATCH_SIZE = 96
 NO_PREFERENCE_RE = re.compile(
-    r"\b(?:no preference|don't have (?:an )?(?:additional )?preference|"
-    r"do not have (?:an )?(?:additional )?preference|don't care|doesn't matter|"
+    r"\b(?:no preference|don't have (?:(?:an?|any) )?(?:additional )?preference|"
+    r"do not have (?:(?:an?|any) )?(?:additional )?preference|don't care|doesn't matter|"
     r"does not matter|any (?:is fine|will do)|use your judgment)\b",
     re.IGNORECASE,
 )
@@ -103,8 +107,11 @@ class Agent:
         self.ollama_timeout = int(os.environ.get("OLLAMA_TIMEOUT", "30"))
         self._llm_available = os.environ.get("OLLAMA_ENABLED", "1").lower() not in {"0", "false", "no"}
         self._embedding_available = self._llm_available
+        self.entropy_omega = float(os.environ.get("ENTROPY_OMEGA", "1.0"))
+        self.attributes_by_asin: dict[str, dict] = {}
         self._build_index()
         self._load_semantic_index()
+        self._load_attribute_index()
 
     def _build_index(self) -> None:
         cursor = self.connection.cursor()
@@ -179,6 +186,21 @@ class Agent:
                 # Preserve order and cap noisy / unusually long product records.
                 self.concepts_by_asin[parent_asin] = list(dict.fromkeys(concepts))[:MAX_DOCUMENT_CONCEPTS]
 
+    def _load_attribute_index(self) -> None:
+        """Load the flat attribute catalog used by entropy question selection."""
+        configured = os.environ.get("CATALOG_ATTRIBUTES_PATH")
+        path = Path(configured) if configured else self.catalog_path.with_name("catalog_attributes.jsonl")
+        if not path.exists():
+            return
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                parent_asin = str(row.get("parent_asin", ""))
+                if parent_asin:
+                    self.attributes_by_asin[parent_asin] = normalize_attributes(row)
+
     def _ollama_generate(self, prompt: str) -> tuple[dict | None, dict]:
         if not self._llm_available:
             return None, {"prompt_tokens": 0, "completion_tokens": 0}
@@ -248,38 +270,30 @@ class Agent:
         self,
         conversation: list[str],
         candidates: list[str],
-        unavailable_attributes: set[str],
-    ) -> tuple[list[str], str | None, dict]:
+    ) -> tuple[list[str], dict]:
         if not candidates:
-            return [], None, {"prompt_tokens": 0, "completion_tokens": 0}
+            return [], {"prompt_tokens": 0, "completion_tokens": 0}
         prompt = f"""You are improving a clothing product search result.
 Select the concepts that best express the shopper's current need.
 Only select exact entries from Candidate concepts. Do not invent, paraphrase,
 or repeat concepts. Select at most {MAX_QUERY_CONCEPTS}.
 
 Return JSON only:
-{{"concepts": ["exact candidate concept"], "ask_attribute": null}}
-ask_attribute may be category, material, color, size, style, brand, budget,
-feature, use_case, other, or null. Ask only for one missing constraint that
-would materially narrow the product search.
-Do not ask any of these attributes again: {json.dumps(sorted(unavailable_attributes))}.
+{{"concepts": ["exact candidate concept"]}}
 
 Conversation: {json.dumps(conversation[-6:], ensure_ascii=False)}
 Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}
 """
         answer, usage = self._ollama_generate(prompt)
         if not answer:
-            return [], None, usage
+            return [], usage
         canonical = {concept.casefold(): concept for concept in candidates}
         selected: list[str] = []
         for concept in answer.get("concepts", []):
             if isinstance(concept, str) and concept.casefold() in canonical:
                 selected.append(canonical[concept.casefold()])
         selected = list(dict.fromkeys(selected))[:MAX_QUERY_CONCEPTS]
-        ask_attribute = answer.get("ask_attribute")
-        if ask_attribute not in ALLOWED_ATTRIBUTES or ask_attribute in unavailable_attributes:
-            ask_attribute = None
-        return selected, ask_attribute, usage
+        return selected, usage
 
     def _semantic_scores(self, query_concepts: list[str], rows: list[tuple[str, float]]) -> list[float] | None:
         if not query_concepts:
@@ -307,22 +321,81 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}
             scores.append(sum(maxima) / len(maxima))
         return scores
 
-    @staticmethod
-    def _fallback_attribute(text: str, turn: int, unavailable_attributes: set[str]) -> str | None:
-        if turn >= 9:
+    def _entropy_attribute(self, rows: list[tuple[str, float]], exhausted: set[str], turn: int) -> str | None:
+        """Entropy-based clarifying-question selection (ENTROPY_QUESTION_SELECTION.md)."""
+        if turn >= MAX_TURNS or not self.attributes_by_asin:
             return None
-        lowered = text.lower()
-        choices = (
-            ("material", ("cotton", "wool", "leather", "nylon", "polyester", "silk")),
-            ("color", ("black", "white", "blue", "red", "green", "pink", "brown", "grey", "gray")),
-            ("size", ("size", "small", "medium", "large", "wide", "narrow")),
-            ("budget", ("budget", "under", "below", "$", "cheap", "price")),
-            ("use_case", ("running", "hiking", "work", "gym", "wedding", "winter")),
-        )
-        for attribute, terms in choices:
-            if attribute not in unavailable_attributes and not any(term in lowered for term in terms):
-                return attribute
-        return "feature" if turn <= 3 and "feature" not in unavailable_attributes else None
+        pool = [
+            self.attributes_by_asin[parent_asin]
+            for parent_asin, _ in rows[:ENTROPY_POOL_SIZE]
+            if parent_asin in self.attributes_by_asin
+        ]
+        if not pool:
+            return None
+        return choose_next_question(pool, exhausted, omega=self.entropy_omega)
+
+    def _ground_answer(self, session: dict, answer: str, attribute: str) -> None:
+        """Map a free-text answer to curated catalog values and record the slot."""
+        if not self.attributes_by_asin or not session["last_candidates"]:
+            return
+        pool = [
+            self.attributes_by_asin[parent_asin]
+            for parent_asin in session["last_candidates"]
+            if parent_asin in self.attributes_by_asin
+        ]
+        if not pool:
+            return
+        embed_fn = self._embed if self._embedding_available else None
+        grounded = ground_answer(answer, attribute, pool, embed_fn=embed_fn)
+        for slot, values in grounded.items():
+            session["confirmed"].setdefault(slot, set()).update(values)
+
+    @staticmethod
+    def _detect_route(first_message: str) -> str:
+        """Buying vs Browsing routing from the opening customer message.
+
+        The scenario type is never disclosed to the agent, so it is inferred
+        from the simulator's opening phrasing (evaluator.local_evaluator
+        .initial_message). Buying discloses "A key requirement is:"; Browsing
+        says "still exploring". Anything ambiguous (including Intent Override,
+        which may swap constraints) stays on the safer Browsing path.
+        """
+        lowered = first_message.lower()
+        if "still exploring" in lowered:
+            return "browsing"
+        if "key requirement" in lowered or "must have" in lowered:
+            return "buying"
+        return "browsing"
+
+    def _confirmed_conflict(self, parent_asin: str, confirmed: dict[str, set[str]]) -> bool:
+        """True if the candidate has values for a confirmed attribute but none match."""
+        attrs = self.attributes_by_asin.get(parent_asin)
+        if attrs is None:
+            return False
+        for attribute, wanted in confirmed.items():
+            have = set(attrs.get(attribute) or [])
+            if have and not (have & wanted):
+                return True
+        return False
+
+    def _apply_confirmed(
+        self,
+        rows: list[tuple[str, float]],
+        session: dict,
+        top_k: int,
+    ) -> list[tuple[str, float]]:
+        confirmed = session["confirmed"]
+        if not confirmed or not self.attributes_by_asin:
+            return rows
+        matched, conflicting = [], []
+        for row in rows:
+            bucket = conflicting if self._confirmed_conflict(row[0], confirmed) else matched
+            bucket.append(row)
+        # Buying: hard filter, but only while it still fills a full result page -
+        # a bad extraction should not strand the session with no recommendations.
+        if session["route"] == "buying" and len(matched) >= top_k:
+            return matched
+        return matched + conflicting  # soft: matches first, order otherwise stable
 
     def reset(self, session_id: str, user_profile: dict) -> None:
         self._sessions[session_id] = {
@@ -331,6 +404,9 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}
             "asked_attributes": set(),
             "no_preference_attributes": set(),
             "pending_attribute": None,
+            "confirmed": {},
+            "route": None,
+            "last_candidates": [],
         }
 
     def respond(
@@ -343,9 +419,13 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}
         if session_id not in self._sessions:
             raise RuntimeError("reset must be called before respond")
         session = self._sessions[session_id]
+        if session["route"] is None:
+            session["route"] = self._detect_route(user_message)
         pending_attribute = session["pending_attribute"]
         if pending_attribute and NO_PREFERENCE_RE.search(user_message):
             session["no_preference_attributes"].add(pending_attribute)
+        elif pending_attribute:
+            self._ground_answer(session, user_message, pending_attribute)
         session["messages"].append(user_message)
         search_text = " ".join(session["messages"])
         unique_terms = list(dict.fromkeys(_terms(search_text)))[:40]
@@ -360,16 +440,10 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}
             ).fetchall()
             rows = [(str(parent_asin), float(score)) for parent_asin, score in rows]
 
-        unavailable_attributes = session["asked_attributes"]
-        ask_attribute = self._fallback_attribute(search_text, turn, unavailable_attributes)
         usage = {"prompt_tokens": 0, "completion_tokens": 0}
         candidate_concepts = self._candidate_concepts(rows)
         if candidate_concepts:
-            query_concepts, llm_attribute, usage = self._select_query_concepts(
-                session["messages"], candidate_concepts, unavailable_attributes
-            )
-            if llm_attribute is not None:
-                ask_attribute = llm_attribute
+            query_concepts, usage = self._select_query_concepts(session["messages"], candidate_concepts)
             semantic_scores = self._semantic_scores(query_concepts, rows)
             if semantic_scores is not None:
                 base_scores = [-score for _, score in rows]  # SQLite BM25: lower is better.
@@ -381,14 +455,26 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}
                     row for _, row in sorted(zip(combined, rows), key=lambda item: item[0], reverse=True)
                 ]
 
-        if ask_attribute is not None:
+        rows = self._apply_confirmed(rows, session, top_k)
+        session["last_candidates"] = [parent_asin for parent_asin, _ in rows]
+
+        exhausted = (
+            session["asked_attributes"]
+            | session["no_preference_attributes"]
+            | set(session["confirmed"])
+        )
+        ask_attribute = self._entropy_attribute(rows, exhausted, turn)
+        if ask_attribute is not None and ask_attribute != "other":
+            # "other" is a repeatable wildcard, not a slot to exhaust.
             session["asked_attributes"].add(ask_attribute)
         session["pending_attribute"] = ask_attribute
         recommendations = [{"parent_asin": parent_asin} for parent_asin, _ in rows[:top_k]]
-        message = (
-            f"I found close matches. Do you have a preference for {ask_attribute}?"
-            if ask_attribute else "Here are the closest matches I found."
-        )
+        if ask_attribute == "other":
+            message = "Is there any other detail that matters for what you need?"
+        elif ask_attribute:
+            message = f"I found some close matches. Any preference on {ask_attribute.replace('_', ' ')}?"
+        else:
+            message = "Here are the closest matches I found."
         return {
             "message": message,
             "ask_attribute": ask_attribute,

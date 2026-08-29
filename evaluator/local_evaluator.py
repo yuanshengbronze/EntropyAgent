@@ -219,6 +219,7 @@ def evaluate(
     catalog_ids: set[str],
     categories: dict[str, list[str]],
     products: dict[str, dict],
+    verbose: bool = False,
 ) -> dict:
     sessions: list[dict] = []
     total_prompt_tokens = 0
@@ -249,6 +250,19 @@ def evaluate(
                 if isinstance(usage.get("completion_tokens"), int) and usage["completion_tokens"] >= 0:
                     total_completion_tokens += usage["completion_tokens"]
             ranked = normalize_recommendations(response.get("recommendations"), catalog_ids)
+            current_rank = ranked.index(target) + 1 if target in ranked else None
+            if verbose:
+                if current_rank is None:
+                    status = "miss"
+                elif override_applied:
+                    status = f"HIT  rank {current_rank}"
+                else:
+                    status = f"miss (rank {current_rank}, override not yet sent)"
+                ask = response.get("ask_attribute")
+                print(
+                    f"  {sample['sample_id']:<15} {sample['scenario_type']:<16} "
+                    f"turn {turn:>2}  ask={str(ask):<9}  {status}"
+                )
             if override_applied and target in ranked:
                 best_rank = ranked.index(target) + 1
                 hit_turn = turn
@@ -266,6 +280,11 @@ def evaluate(
                 user_message, boundary_used = customer_reply(
                     effective_sample, response.get("ask_attribute"), disclosed, boundary_used
                 )
+        if verbose:
+            if hit_turn is not None:
+                print(f"  {sample['sample_id']:<15} => HIT at turn {hit_turn}, rank {best_rank}\n")
+            else:
+                print(f"  {sample['sample_id']:<15} => MISS (target never in scored Top 10)\n")
         sessions.append({
             "sample_id": sample["sample_id"],
             "scenario_type": sample["scenario_type"],
@@ -300,10 +319,16 @@ def main() -> None:
     parser.add_argument("--catalog", default="data/catalog.jsonl")
     parser.add_argument("--dataset", default="data/public_set.jsonl")
     parser.add_argument("--output", default="results.json")
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Print per-turn hit/miss, the asked attribute, and the target's rank.",
+    )
     args = parser.parse_args()
     samples = load_jsonl(args.dataset)
     catalog_ids, categories, products = catalog_index(args.catalog)
-    result = evaluate(Agent(args.catalog), samples, catalog_ids, categories, products)
+    result = evaluate(
+        Agent(args.catalog), samples, catalog_ids, categories, products, verbose=args.verbose
+    )
     Path(args.output).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({key: value for key, value in result.items() if key != "sessions"}, indent=2))
 
