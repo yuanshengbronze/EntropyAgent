@@ -60,6 +60,10 @@ DEFAULT_SEMANTIC_CANDIDATES = 50
 SEMANTIC_CANDIDATES = int(
     os.environ.get("SEMANTIC_CANDIDATES", str(DEFAULT_SEMANTIC_CANDIDATES))
 )
+DEFAULT_OVERRIDE_CANDIDATES = 150
+OVERRIDE_CANDIDATES = int(
+    os.environ.get("OVERRIDE_CANDIDATES", str(DEFAULT_OVERRIDE_CANDIDATES))
+)
 ENTROPY_POOL_SIZE = 20
 MAX_TURNS = 10
 MAX_CANDIDATE_CONCEPTS = 60
@@ -77,6 +81,8 @@ DEFAULT_SEMANTIC_EXPANSION_WEIGHT = 0.20
 SEMANTIC_EXPANSION_WEIGHT = float(
     os.environ.get("SEMANTIC_EXPANSION_WEIGHT", str(DEFAULT_SEMANTIC_EXPANSION_WEIGHT))
 )
+SEMANTIC_REQUIREMENT_WEIGHT = 3.0
+SEMANTIC_CONFIRMED_WEIGHT = 2.0
 HARD_CONSTRAINT_BONUS = 1.40
 HARD_CONSTRAINT_PENALTY = 2.20
 QUESTION_CONFIDENCE_TEMPERATURE = 0.85
@@ -112,6 +118,44 @@ DIRECT_REQUIREMENT_RE = re.compile(
     r"\b(?:what\s+matters\s+is|what\s+i\s+(?:need|want)\s+is|must\s+have)\s*[:,-]?\s*(.+)$",
     re.IGNORECASE,
 )
+EXPLICIT_ATTRIBUTE_RE = re.compile(
+    r"^\s*(category|materials?|colou?r|sizes?|style|brand|budget|price|features?|"
+    r"use[ _-]?cases?|other)\s*:\s*(.+)$",
+    re.IGNORECASE,
+)
+ATTRIBUTE_ALIASES = {
+    "materials": "material",
+    "colour": "color",
+    "sizes": "size",
+    "price": "budget",
+    "features": "feature",
+    "use case": "use_case",
+    "use-case": "use_case",
+    "use cases": "use_case",
+    "use-cases": "use_case",
+}
+ATTRIBUTE_HINTS = {
+    "material": re.compile(
+        r"\b(?:cotton|polyester|nylon|leather|wool|spandex|silk|rayon|fabric|"
+        r"synthetic|textile|rubber|alloy|steel|metal|linen|denim)\b",
+        re.IGNORECASE,
+    ),
+    "color": re.compile(
+        r"\b(?:colou?r|black|white|blue|red|pink|green|brown|gr[ae]y|purple|"
+        r"yellow|orange|gold|silver)\b",
+        re.IGNORECASE,
+    ),
+    "size": re.compile(r"\b(?:size|sizing|width|wide|narrow)\b", re.IGNORECASE),
+    "style": re.compile(
+        r"\b(?:department|style|fit|fitted|loose|sleeve|neck|casual|formal)\b",
+        re.IGNORECASE,
+    ),
+    "use_case": re.compile(
+        r"\b(?:hiking|running|gym|winter|outdoor|work|wedding|party|travel)\b",
+        re.IGNORECASE,
+    ),
+    "budget": re.compile(r"(?:\bbudget\b|\bprice\b|\bunder\s+\$?\d|\$\s*\d)", re.IGNORECASE),
+}
 
 
 def _text(value: object) -> str:
@@ -136,6 +180,21 @@ def _informative_concept(concept: str) -> bool:
     """Exclude missing-value placeholders from semantic retrieval signals."""
     _, separator, value = concept.partition(":")
     return not separator or value.strip().casefold() not in MISSING_CONCEPT_VALUES
+
+
+def _attribute_value_matches(have: str, wanted: str) -> bool:
+    """Match a normalized value while allowing qualified catalog wording."""
+    have_key = have.casefold().strip()
+    wanted_key = wanted.casefold().strip()
+    if have_key == wanted_key:
+        return True
+    have_terms = set(_terms(have_key))
+    wanted_terms = set(_terms(wanted_key))
+    return bool(
+        have_terms
+        and wanted_terms
+        and (have_terms <= wanted_terms or wanted_terms <= have_terms)
+    )
 
 
 def _z_scores(values: list[float]) -> list[float]:
@@ -197,6 +256,9 @@ class Agent:
             os.environ.get("SEMANTIC_RERANK_ENABLED", "1").lower() not in {"0", "false", "no"}
         )
         self.attributes_by_asin: dict[str, dict] = {}
+        self.attribute_values: dict[str, set[str]] = {
+            attribute: set() for attribute in ASKABLE_ATTRIBUTES
+        }
         self.ratings_by_asin: dict[str, tuple[float, float]] = {}
         self.connection = self._open_fts_cache()
         self._load_semantic_index()
@@ -362,7 +424,10 @@ class Agent:
             parent_asin = str(row.get("parent_asin", ""))
             if not parent_asin:
                 continue
-            self.attributes_by_asin[parent_asin] = normalize_attributes(row)
+            attributes = normalize_attributes(row)
+            self.attributes_by_asin[parent_asin] = attributes
+            for attribute in ASKABLE_ATTRIBUTES:
+                self.attribute_values[attribute].update(attributes.get(attribute) or [])
             rating = _finite_number(row.get("average_rating"))
             review_count = _finite_number(row.get("rating_number"))
             if rating is not None and 0.0 <= rating <= 5.0:
@@ -471,40 +536,47 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
         return selected, usage
 
     @staticmethod
-    def _direct_semantic_queries(session: dict) -> list[str]:
-        """Keep the shopper's own active wording as the primary semantic query."""
-        categories = [
-            f"category: {group['text']}"
-            for group in session["term_groups"]
-            if group["kind"] == "category" and group["text"]
-        ]
-        preferences = [
-            f"shopper request: {group['text']}"
-            for group in session["term_groups"]
-            if group["kind"] == "preference" and group["text"]
-        ][-5:]
-        confirmed = [
-            f"required {attribute}: {value}"
+    def _direct_semantic_queries(session: dict) -> list[tuple[str, float]]:
+        """Build weighted queries, prioritizing hard needs over stable category."""
+        weighted: list[tuple[str, float]] = []
+        for group in session["term_groups"]:
+            text = group["text"]
+            if not text:
+                continue
+            if group["kind"] == "category":
+                weighted.append((f"category: {text}", 1.0))
+            elif group["kind"] == "requirement":
+                weighted.append((f"required shopper need: {text}", SEMANTIC_REQUIREMENT_WEIGHT))
+            else:
+                weighted.append((f"shopper request: {text}", 1.0))
+        weighted = weighted[-6:]
+        weighted.extend(
+            (f"required {attribute}: {value}", SEMANTIC_CONFIRMED_WEIGHT)
             for attribute, values in session["confirmed"].items()
             for value in sorted(values)
-        ]
-        return list(dict.fromkeys([*categories, *preferences, *confirmed]))
+        )
+        deduplicated: dict[str, float] = {}
+        for query, weight in weighted:
+            deduplicated[query] = max(weight, deduplicated.get(query, 0.0))
+        return list(deduplicated.items())
 
     def _semantic_scores(
         self,
-        direct_queries: list[str],
+        direct_queries: list[tuple[str, float]],
         query_concepts: list[str],
         rows: list[tuple[str, float]],
     ) -> list[float] | None:
+        direct_queries = [(query, weight) for query, weight in direct_queries if weight > 0.0]
         if not direct_queries:
             return None
+        direct_texts = [query for query, _ in direct_queries]
         document_concepts = list(dict.fromkeys(
             concept for parent_asin, _ in rows
             for concept in self.concepts_by_asin.get(parent_asin, [])
             if _informative_concept(concept)
         ))
-        embeddings = self._embed([*direct_queries, *query_concepts, *document_concepts])
-        if embeddings is None or any(query not in embeddings for query in direct_queries):
+        embeddings = self._embed([*direct_texts, *query_concepts, *document_concepts])
+        if embeddings is None or any(query not in embeddings for query in direct_texts):
             return None
         # Normalizing once avoids recalculating two vector norms for every
         # query/document pair (thousands of pairs per rerank).
@@ -522,10 +594,20 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
             # The shopper's own words always determine most of the score. Each
             # direct query fragment matches its closest document concept.
             direct_maxima = [
-                max(sum(a * b for a, b in zip(vectors[query], vectors[document])) for document in concepts)
-                for query in direct_queries
+                (
+                    max(
+                        sum(a * b for a, b in zip(vectors[query], vectors[document]))
+                        for document in concepts
+                    ),
+                    weight,
+                )
+                for query, weight in direct_queries
             ]
-            direct_score = sum(direct_maxima) / len(direct_maxima)
+            total_direct_weight = sum(weight for _, weight in direct_maxima)
+            direct_score = (
+                sum(similarity * weight for similarity, weight in direct_maxima)
+                / total_direct_weight
+            )
 
             available_expansions = [query for query in query_concepts if query in vectors]
             if not available_expansions:
@@ -560,14 +642,25 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
         return ordered[0] - ordered[1] >= SEMANTIC_CONFIDENCE_MARGIN
 
     def _retrieve_candidates(
-        self, expression: str, with_evidence: bool
+        self,
+        expression: str,
+        with_evidence: bool,
+        candidate_limit: int = SEMANTIC_CANDIDATES,
+        excluded_asins: set[str] | None = None,
     ) -> tuple[list[tuple[str, float]], dict[str, str]]:
-        """Run weighted BM25; materialize field evidence only when constraints need it."""
+        """Run weighted BM25, omitting products already shown in this session."""
         selected_fields = f", {', '.join(SEARCH_FIELDS)}" if with_evidence else ""
+        excluded = sorted(excluded_asins or ())
+        exclusion_clause = ""
+        parameters: list[object] = [expression]
+        if excluded:
+            exclusion_clause = f" AND parent_asin NOT IN ({', '.join('?' for _ in excluded)})"
+            parameters.extend(excluded)
+        parameters.append(candidate_limit)
         rows = self.connection.execute(
             f"SELECT parent_asin{selected_fields}, {BM25} FROM products "
-            f"WHERE products MATCH ? ORDER BY {BM25} LIMIT ?",
-            (expression, SEMANTIC_CANDIDATES),
+            f"WHERE products MATCH ?{exclusion_clause} ORDER BY {BM25} LIMIT ?",
+            parameters,
         ).fetchall()
         evidence: dict[str, str] = {}
         scored: list[tuple[str, float]] = []
@@ -635,7 +728,11 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
                 wanted = constraint["values"]
                 have = {str(value).casefold() for value in attrs.get(attribute, [])} if attribute else set()
                 if have and wanted:
-                    match = float(bool(have & wanted))
+                    match = float(any(
+                        _attribute_value_matches(have_value, wanted_value)
+                        for have_value in have
+                        for wanted_value in wanted
+                    ))
                     contradicted = not match
                 else:
                     terms = set(constraint["terms"])
@@ -655,7 +752,12 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
             def conflicts_with_confirmed(row: tuple[str, float]) -> bool:
                 attrs = self.attributes_by_asin.get(row[0], {})
                 return any(
-                    (have := set(attrs.get(attribute) or [])) and have.isdisjoint(wanted)
+                    (have := set(attrs.get(attribute) or []))
+                    and not any(
+                        _attribute_value_matches(str(have_value), str(wanted_value))
+                        for have_value in have
+                        for wanted_value in wanted
+                    )
                     for attribute, wanted in confirmed.items()
                 )
 
@@ -818,26 +920,116 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
                     terms.append(term)
         session["active_terms"] = terms
 
+    def _infer_override_constraint(self, text: str) -> tuple[str | None, set[str]]:
+        """Map an explicit replacement need to a canonical catalog attribute/value."""
+        explicit = EXPLICIT_ATTRIBUTE_RE.match(text)
+        if explicit:
+            raw_attribute, value_text = explicit.groups()
+            normalized_attribute = raw_attribute.casefold().replace("_", " ")
+            attribute = ATTRIBUTE_ALIASES.get(
+                normalized_attribute,
+                normalized_attribute.rstrip("s").replace(" ", "_"),
+            )
+            candidate_attributes = (attribute,) if attribute in self.attribute_values else ()
+        else:
+            value_text = text
+            hinted = [
+                attribute
+                for attribute, pattern in ATTRIBUTE_HINTS.items()
+                if pattern.search(value_text)
+            ]
+            remaining = [
+                attribute
+                for attribute in ASKABLE_ATTRIBUTES
+                if attribute not in hinted and attribute not in {"category", "brand", "budget"}
+            ]
+            candidate_attributes = (*hinted, *remaining)
+
+        query_key = " ".join(value_text.casefold().split()).strip(" -,:;.")
+        query_terms = set(_terms(value_text))
+        if not query_key or not query_terms:
+            return (candidate_attributes[0] if candidate_attributes else None), set()
+
+        best_attribute: str | None = None
+        best_score = 0.0
+        best_values: set[str] = set()
+        hinted_attributes = {
+            attribute
+            for attribute, pattern in ATTRIBUTE_HINTS.items()
+            if pattern.search(value_text)
+        }
+        for attribute in candidate_attributes:
+            attribute_best = 0.0
+            attribute_values: set[str] = set()
+            for value in self.attribute_values.get(attribute, set()):
+                value_key = " ".join(value.casefold().split()).strip(" -,:;.")
+                value_terms = set(_terms(value))
+                if not value_key or not value_terms:
+                    continue
+                if value_key == query_key:
+                    score = 1.0
+                elif value_terms <= query_terms or query_terms <= value_terms:
+                    if all(term.isdigit() for term in value_terms):
+                        continue
+                    score = 0.90
+                else:
+                    overlap = len(query_terms & value_terms)
+                    if not overlap:
+                        continue
+                    query_coverage = overlap / len(query_terms)
+                    value_coverage = overlap / len(value_terms)
+                    if min(query_coverage, value_coverage) < 0.75:
+                        continue
+                    score = 0.55 + 0.35 * min(query_coverage, value_coverage)
+                if attribute in hinted_attributes:
+                    score += 0.15
+                if score > attribute_best + 1e-9:
+                    attribute_best = score
+                    attribute_values = {value.casefold()}
+                elif abs(score - attribute_best) <= 1e-9:
+                    attribute_values.add(value.casefold())
+            if attribute_best > best_score + 1e-9:
+                best_attribute = attribute
+                best_score = attribute_best
+                best_values = attribute_values
+
+        if best_score < 0.70:
+            fallback = candidate_attributes[0] if explicit and candidate_attributes else None
+            return fallback, set()
+        return best_attribute, set(sorted(best_values)[:6])
+
     def _record_message_terms(self, session: dict, message: str) -> bool:
         """Add a turn to retrieval state, retiring superseded preferences."""
         is_override = bool(OVERRIDE_RE.search(message))
         if is_override:
             # Keep the category disclosed in the opening turn, but retire every
-            # prior preference - including grounded slots - before rebuilding
-            # the retrieval state from the replacement request.
+            # prior positive preference before rebuilding retrieval state. A
+            # prior "no preference" remains valid unless this override supplies
+            # a value for that same attribute.
             session["term_groups"] = [
                 group for group in session["term_groups"] if group["kind"] == "category"
             ]
             session["constraints"].clear()
             session["confirmed"].clear()
-            session["no_preference_attributes"].clear()
             session["asked_attributes"].clear()
             session["pending_attribute"] = None
             value = OVERRIDE_VALUE_RE.search(message)
             text = value.group(1) if value else message
             terms = _terms(text)
-            session["term_groups"].append({"text": text, "terms": terms, "kind": "preference"})
-            self._add_constraint(session, text=text)
+            session["term_groups"].append({"text": text, "terms": terms, "kind": "requirement"})
+            attribute, values = self._infer_override_constraint(text)
+            if attribute is not None:
+                session["no_preference_attributes"].discard(attribute)
+            if attribute is not None and values:
+                session["confirmed"][attribute] = set(values)
+                self._add_constraint(
+                    session,
+                    text=text,
+                    attribute=attribute,
+                    values=values,
+                )
+            else:
+                self._add_constraint(session, text=text)
         elif not session["term_groups"]:
             # The opening message carries both the stable category and an
             # optional preference. Preserve only the category on an override.
@@ -880,6 +1072,7 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
             "confirmed": {},
             "constraints": [],
             "route": None,
+            "shown_parent_asins": set(),
             "last_candidates": [],
             "last_rows": [],
             "last_evidence": {},
@@ -896,10 +1089,17 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
         if session_id not in self._sessions:
             raise RuntimeError("reset must be called before respond")
         session = self._sessions[session_id]
+        shown_parent_asins: set[str] = session["shown_parent_asins"]
         if session["route"] is None:
             session["route"] = self._detect_route(user_message)
         pending_attribute = session["pending_attribute"]
         is_override_message = bool(OVERRIDE_RE.search(user_message))
+        if is_override_message:
+            # The evaluator does not score recommendations shown before an
+            # intent override. Start a new exclusion window so those products,
+            # including the eventual target, may be recommended again under
+            # the replacement intent.
+            shown_parent_asins.clear()
         no_preference_reply = bool(
             not is_override_message and pending_attribute and NO_PREFERENCE_RE.search(user_message)
         )
@@ -915,6 +1115,7 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
         diagnostics = {
             "turn": turn,
             "lexical_candidates": 0,
+            "retrieval_limit": 0,
             "semantic_requested": False,
             "semantic_used": False,
             "semantic_confident": False,
@@ -924,8 +1125,26 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
         if no_preference_reply and session["last_rows"]:
             # A declined attribute adds no retrieval evidence. Keep the prior
             # ranking and do not pollute the FTS query with the refusal text.
-            rows = list(session["last_rows"])
-            evidence = dict(session["last_evidence"])
+            # Products previously displayed are treated as rejected: the
+            # evaluator would already have ended the conversation otherwise.
+            rows = [row for row in session["last_rows"] if row[0] not in shown_parent_asins]
+            evidence = {
+                parent_asin: value
+                for parent_asin, value in session["last_evidence"].items()
+                if parent_asin not in shown_parent_asins
+            }
+            if len(rows) < top_k and session["active_terms"]:
+                expression = " OR ".join(f'"{term}"' for term in session["active_terms"])
+                rows, evidence = self._retrieve_candidates(
+                    expression,
+                    bool(session["constraints"]),
+                    SEMANTIC_CANDIDATES,
+                    shown_parent_asins,
+                )
+                rows = self._apply_profile_rating(rows, session["profile"])
+                rows, constraint_diagnostics = self._apply_constraints(rows, session, evidence, top_k)
+                diagnostics["lexical_candidates"] = len(rows)
+                diagnostics.update(constraint_diagnostics)
         else:
             is_override_message = self._record_message_terms(session, user_message)
             diagnostics["override"] = is_override_message
@@ -934,7 +1153,16 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
                 rows: list[tuple[str, float]] = []
                 evidence = {}
             else:
-                rows, evidence = self._retrieve_candidates(expression, bool(session["constraints"]))
+                candidate_limit = (
+                    OVERRIDE_CANDIDATES if is_override_message else SEMANTIC_CANDIDATES
+                )
+                diagnostics["retrieval_limit"] = candidate_limit
+                rows, evidence = self._retrieve_candidates(
+                    expression,
+                    bool(session["constraints"]),
+                    candidate_limit,
+                    shown_parent_asins,
+                )
             diagnostics["lexical_candidates"] = len(rows)
 
             # Retrieval context is used for the initial view and whenever the
@@ -989,6 +1217,7 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
         diagnostics["top_score_gap"] = round(rows[0][1] - rows[1][1], 6) if len(rows) > 1 else None
         session["diagnostics"].append(diagnostics)
         recommendations = [{"parent_asin": parent_asin} for parent_asin, _ in rows[:top_k]]
+        shown_parent_asins.update(item["parent_asin"] for item in recommendations)
         if ask_attribute == "other":
             message = "Is there any other detail that matters for what you need?"
         elif ask_attribute:
