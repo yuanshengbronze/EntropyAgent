@@ -3,10 +3,10 @@ from __future__ import annotations
 import unittest
 
 from starter.question_selection import (
+    ASKABLE_ATTRIBUTES,
     choose_next_question,
     gain_ratio_multilabel_missing,
     ground_answer,
-    information_cost_score,
     multi_label_entropy,
     normalize_attributes,
 )
@@ -31,9 +31,7 @@ WORKED_EXAMPLE = _pool({
     "use_case": [["casual"]] * 19 + [["athletic"]],
 })
 
-ALL_ASKABLE = {
-    "category", "material", "color", "size", "style", "brand", "budget", "feature", "use_case",
-}
+ALL_ASKABLE = set(ASKABLE_ATTRIBUTES)
 
 
 class MultiLabelEntropyTest(unittest.TestCase):
@@ -73,25 +71,18 @@ class GainRatioTest(unittest.TestCase):
         )
 
 
-class InformationCostScoreTest(unittest.TestCase):
-    def test_omega_flips_preference_toward_cheaper_attribute(self) -> None:
-        # a: higher gain, higher cost. b: lower gain, free.
-        self.assertGreater(
-            information_cost_score(1.0, cost=1.0, omega=0.0),
-            information_cost_score(0.5, cost=0.0, omega=0.0),
-        )
-        self.assertLess(
-            information_cost_score(1.0, cost=1.0, omega=3.0),
-            information_cost_score(0.5, cost=0.0, omega=3.0),
-        )
-
-
 class ChooseNextQuestionTest(unittest.TestCase):
-    def test_worked_example_picks_color(self) -> None:
-        self.assertEqual(choose_next_question(WORKED_EXAMPLE), "color")
+    def test_worked_example_prefers_a_clean_binary_split(self) -> None:
+        # Without the answerability cost term the pick is pure gain ratio. Any
+        # clean 2-value split normalises to gain ratio 2.0 (H = 2*Hb, SI = Hb),
+        # so style (15/5) and use_case (19/1) both beat color's 3-way 14/3/3
+        # spread; style wins on candidate order.
+        self.assertEqual(choose_next_question(WORKED_EXAMPLE), "style")
 
     def test_exhausted_attribute_is_skipped(self) -> None:
-        self.assertEqual(choose_next_question(WORKED_EXAMPLE, exhausted={"color"}), "style")
+        self.assertEqual(
+            choose_next_question(WORKED_EXAMPLE, exhausted={"style"}), "use_case"
+        )
 
     def test_empty_pool_falls_back_to_other(self) -> None:
         self.assertEqual(choose_next_question([]), "other")
@@ -102,27 +93,24 @@ class ChooseNextQuestionTest(unittest.TestCase):
     def test_other_also_exhausted_returns_none(self) -> None:
         self.assertIsNone(choose_next_question(WORKED_EXAMPLE, exhausted=ALL_ASKABLE | {"other"}))
 
-    def test_category_and_brand_are_suppressed_not_excluded(self) -> None:
-        # brand splits the pool 20 ways (real signal) but its answerability prior
-        # is ~0, so a modestly-informative color question still wins.
+    def test_category_and_brand_are_not_in_the_default_candidate_set(self) -> None:
+        self.assertNotIn("category", ASKABLE_ATTRIBUTES)
+        self.assertNotIn("brand", ASKABLE_ATTRIBUTES)
+        # A pool that only disagrees on category/brand has nothing askable left.
         pool = _pool({
+            "category": [["shirts"]] * 12 + [["pants"]] * 8,
             "brand": [[f"brand{i}"] for i in range(20)],
-            "color": [["blue"]] * 10 + [["red"]] * 10,
         })
-        self.assertGreater(gain_ratio_multilabel_missing(pool, "brand"), 0.0)
-        self.assertEqual(choose_next_question(pool, askable=("brand", "color")), "color")
+        self.assertEqual(choose_next_question(pool), "other")
 
-    def test_equal_priors_prefer_the_cleaner_split(self) -> None:
+    def test_the_cleaner_split_wins_on_gain_ratio_alone(self) -> None:
         pool = _pool({
             "clean": [["a"]] * 10 + [["b"]] * 10,
             "frag": [[f"v{i}"] for i in range(20)],
         })
-        chosen = choose_next_question(
-            pool,
-            priors={"clean": 0.5, "frag": 0.5},
-            askable=("clean", "frag"),
+        self.assertEqual(
+            choose_next_question(pool, askable=("clean", "frag")), "clean"
         )
-        self.assertEqual(chosen, "clean")
 
 
 class NormalizeAttributesTest(unittest.TestCase):

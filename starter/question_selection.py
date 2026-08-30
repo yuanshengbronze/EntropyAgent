@@ -14,8 +14,8 @@ Pipeline (see the spec for citations):
    for attributes fragmented into many near-unique values.
 3. coverage discount         - C4.5-style handling of missing values: scale the
    score by the fraction of the pool that can even answer the question.
-4. ``choose_next_question``  - Nunez EG2 (1991) Information Cost Function folds
-   in how answerable each attribute actually is for the simulator.
+4. ``choose_next_question``  - picks ``argmax`` of the coverage-discounted
+   multi-label gain ratio: the attribute where the current pool disagrees most.
 
 ``ground_answer`` closes the loop: a free-text simulator answer ("sporty")
 rarely matches a curated catalog value ("athletic") verbatim, so it is mapped
@@ -31,47 +31,18 @@ import re
 from typing import Callable, Iterable, Sequence
 
 # Every attribute the Agent API allows except ``null`` and ``other`` (the
-# wildcard fallback, scored separately). ``category`` and ``brand`` are kept in
-# the set but heavily suppressed by their answerability priors below rather than
-# excluded outright - the local simulator never answers them, but the component
-# should not hard-code that assumption about the private evaluator.
+# wildcard fallback, scored separately). ``category`` and ``brand`` are left
+# out: the category is already stated in the opening message, and neither is
+# something the pool structure can meaningfully be split on here.
 ASKABLE_ATTRIBUTES: tuple[str, ...] = (
-    "category",
     "material",
     "color",
     "size",
     "style",
-    "brand",
     "budget",
     "feature",
     "use_case",
 )
-
-# How often the deterministic simulator can actually answer a question about
-# each attribute, used as the EG2 cost term ``cost = 1 / prior``. Estimated
-# from the structure of ``evaluator.local_evaluator``:
-#   - ``intent_card`` front-loads a material and a color constraint whenever the
-#     product text mentions one, so ``material``/``color`` are frequently
-#     answerable; ``"budget around $X"`` is appended last and almost never
-#     survives into the disclosed window.
-#   - ``classify_constraint`` routes any unrecognised phrase to ``feature``,
-#     making it a near-catch-all; ``style`` needs department/fit/sleeve/neck
-#     wording, ``size`` needs width/size wording, ``use_case`` needs an activity
-#     word - all comparatively rare. It has no branch for ``category``/``brand``.
-#   - ``other`` matches any undisclosed constraint (wildcard).
-# Rough values - tune against a dev sample, never the official public set.
-ANSWERABILITY_PRIOR: dict[str, float] = {
-    "feature": 0.90,
-    "material": 0.70,
-    "color": 0.25,
-    "style": 0.10,
-    "size": 0.05,
-    "use_case": 0.02,
-    "budget": 0.01,      # appended last in intent_card; floored so cost stays finite
-    "category": 0.005,   # stated in the opening message; simulator never re-answers
-    "brand": 0.005,      # simulator has no brand branch; kept only for robustness
-    "other": 0.95,
-}
 
 EPSILON = 1e-9
 
@@ -239,32 +210,26 @@ def _with_budget_buckets(pool: Sequence[dict], buckets: int = _BUDGET_BUCKETS) -
     return view
 
 
-def information_cost_score(gain_ratio: float, cost: float, omega: float) -> float:
-    """Nunez EG2 Information Cost Function: ``(2**gr - 1) / (cost + 1)**omega``."""
-    return (2.0 ** gain_ratio - 1.0) / (cost + 1.0) ** omega
-
-
 def choose_next_question(
     pool: Sequence[dict],
     exhausted: Iterable[str] = (),
     *,
-    omega: float = 1.0,
-    priors: dict[str, float] | None = None,
     askable: Sequence[str] = ASKABLE_ATTRIBUTES,
 ) -> str | None:
     """Pick the attribute worth asking about next.
 
     ``pool`` is the current ranked candidate set as normalized attribute maps
     (see ``normalize_attributes``). ``exhausted`` are attributes already asked
-    or declined. For each remaining attribute: coverage-discounted multi-label
-    gain ratio, then EG2 cost weighting by ``1 / answerability_prior``.
+    or declined. Each remaining attribute is scored by its coverage-discounted
+    multi-label gain ratio and the highest wins - the attribute where the
+    current pool disagrees most, after the cardinality and missing-value
+    corrections.
 
     Falls back to ``"other"`` - the wildcard that matches any undisclosed
     constraint - when nothing scores above ``EPSILON``; or to ``None`` (ask
     nothing this turn) once ``"other"`` itself is in ``exhausted``. Each
     attribute is asked at most once, so late turns carry recommendations only.
     """
-    priors = priors or ANSWERABILITY_PRIOR
     blocked = set(exhausted)
     fallback = None if "other" in blocked else "other"
     candidates = [a for a in askable if a not in blocked]
@@ -278,11 +243,8 @@ def choose_next_question(
     scores: dict[str, float] = {}
     for attribute in candidates:
         gain_ratio = gain_ratio_multilabel_missing(scored_pool, attribute)
-        if gain_ratio <= 0.0:
-            continue
-        prior = priors.get(attribute, 0.5)
-        cost = 1.0 / prior if prior > 0.0 else math.inf
-        scores[attribute] = information_cost_score(gain_ratio, cost, omega)
+        if gain_ratio > 0.0:
+            scores[attribute] = gain_ratio
 
     if not scores or max(scores.values()) < EPSILON:
         return fallback

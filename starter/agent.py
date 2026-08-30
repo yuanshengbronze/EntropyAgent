@@ -15,12 +15,10 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from starter.question_selection import (
-    ANSWERABILITY_PRIOR,
     ASKABLE_ATTRIBUTES,
     choose_next_question,
     gain_ratio_multilabel_missing,
     ground_answer,
-    information_cost_score,
     normalize_attributes,
 )
 from starter.semantic_index import concepts_for_item, file_sha256
@@ -198,7 +196,6 @@ class Agent:
         self.semantic_rerank_enabled = (
             os.environ.get("SEMANTIC_RERANK_ENABLED", "1").lower() not in {"0", "false", "no"}
         )
-        self.entropy_omega = float(os.environ.get("ENTROPY_OMEGA", "1.0"))
         self.attributes_by_asin: dict[str, dict] = {}
         self.ratings_by_asin: dict[str, tuple[float, float]] = {}
         self.connection = self._open_fts_cache()
@@ -706,20 +703,18 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
             split = 1.0 - sum((mass / incidence) ** 2 for mass in value_mass.values())
             coverage = known_weight / total_weight
             gain_ratio = gain_ratio_multilabel_missing(pool, attribute)
-            prior = ANSWERABILITY_PRIOR.get(attribute, 0.5)
-            entropy_utility = information_cost_score(gain_ratio, 1.0 / prior, self.entropy_omega)
             # The first term is expected mass removed by a useful answer; the
-            # second preserves the multi-label/cardinality safeguards already
-            # encoded in question_selection.py.
-            utilities[attribute] = ambiguity * coverage * split * prior + 0.35 * entropy_utility
+            # second carries the multi-label / cardinality / missing-value
+            # safeguards from question_selection.py.
+            utilities[attribute] = ambiguity * coverage * split + 0.35 * gain_ratio
 
         if not utilities:
-            return choose_next_question(pool, exhausted, omega=self.entropy_omega), 0.0
+            return choose_next_question(pool, exhausted), 0.0
         attribute, utility = max(utilities.items(), key=lambda item: item[1])
         # Preserve the wildcard escape hatch when structured attributes have no
         # plausible value-of-information, but do not ask it after it was spent.
         if utility < 0.005:
-            return choose_next_question(pool, exhausted, omega=self.entropy_omega), utility
+            return choose_next_question(pool, exhausted), utility
         return attribute, utility
 
     def _ground_answer(self, session: dict, answer: str, attribute: str) -> bool:

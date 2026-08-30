@@ -20,15 +20,14 @@ wildcard fallback. This document covers exactly one function:
 ask_attribute = choose_next_question(top_k_candidates, exhausted_slots)
 ```
 
-> **`category` and `brand` are suppressed, not excluded.**
+> **`category` and `brand` are excluded.**
+> The category is already stated in the opening message, and
 > `evaluator/local_evaluator.py`'s `classify_constraint` has no branch that
-> returns `category` or `brand`, so against the *local* evaluator those two
-> questions always draw "no preference" (and the category is already stated
-> in the opening message). They stay in the candidate set but with a
-> near-zero answerability prior (§4), which the cost term drives to the
-> bottom — so they are only ever asked when nothing else has any signal.
-> The component should not hard-code an assumption about a simulator the
-> private evaluation set may not share.
+> returns `category` or `brand`, so those questions only ever draw "no
+> preference". They are left out of `ASKABLE_ATTRIBUTES` entirely — earlier
+> revisions kept them in the set behind a near-zero answerability prior; that
+> whole cost mechanism has since been removed (see §4), so exclusion is now
+> the only lever.
 
 `top_k_candidates` is Signal 1's current ranked output (e.g. top 20
 products by search score) — this function never looks at the whole
@@ -201,29 +200,24 @@ def gain_ratio_multilabel_missing(top_k, attribute):
     return gain_ratio * coverage                          # missingness discount, §3.2
 ```
 
-### Cost-weighting on top — why raw gain ratio still isn't the final score
+### No cost-weighting — the score is the gain ratio itself
 
-Even a high-gain-ratio attribute might be nearly unanswerable by the
-simulator (e.g. `budget` is usually buried outside the disclosed
-constraint window; `category` / `brand` are never classified at all —
-see §1). Fold in the reverse-engineered answerability priors using EG2's
-Information Cost Function (Núñez, *Machine Learning*, 1991 — via survey
-https://www.researchgate.net/publication/261853221):
-
-```
-ICF(A) = (2^GainRatio(A) - 1) / (Cost(A) + 1)^ω
-```
+An earlier revision multiplied the gain ratio through EG2's Information Cost
+Function `(2^GR − 1) / (cost + 1)^ω`, with `cost = 1 / answerability_prior`
+and the priors reverse-engineered from the local simulator's
+`classify_constraint`. That has been removed: the priors were hand-estimated
+against one simulator, dominated the score (a low-prior attribute needed
+~10× the gain ratio to be picked), and made the entropy computation nearly
+decorative. The pick is now simply `argmax` of the coverage-discounted gain
+ratio.
 
 ```python
-def choose_next_question(top_k, exhausted, omega=1.0):
-    candidates = {"category", "material", "color", "size", "style",
-                  "brand", "budget", "feature", "use_case"} - exhausted
+def choose_next_question(top_k, exhausted):
+    candidates = {"material", "color", "size", "style",
+                  "budget", "feature", "use_case"} - exhausted
 
-    scores = {}
-    for a in candidates:
-        gr = gain_ratio_multilabel_missing(top_k, a)
-        cost = 1.0 / answerability_prior(a)   # from reverse-engineered simulator rules
-        scores[a] = (2 ** gr - 1) / (cost + 1) ** omega
+    scores = {a: gain_ratio_multilabel_missing(top_k, a) for a in candidates}
+    scores = {a: s for a, s in scores.items() if s > 0.0}
 
     if not scores or max(scores.values()) < EPSILON:
         return None if "other" in exhausted else "other"   # wildcard, then silence
@@ -235,13 +229,11 @@ confirmed. `"other"` is the safe fallback — it bypasses classification and
 matches any undisclosed constraint; once it too is exhausted the function
 returns `None` and the agent asks nothing that turn.
 
-`category` and `brand` are in `candidates` but carry a near-zero
-answerability prior (`~0.005`), so `ICF` pushes them to the bottom unless
-nothing else has any signal. The local simulator never answers them; the
-private evaluator might, so they are suppressed rather than removed.
-
-`omega` is a free parameter controlling how strongly cost dominates gain —
-tune it against a dev sample (grid search, see main README §4).
+**Known quirk:** with the multi-label split-information normalisation, any
+clean two-value split scores exactly gain ratio `2.0` (`H = 2·Hb`,
+`SI = Hb`), so binary-valued attributes are always preferred over a 3+-value
+attribute no matter how evenly the larger one splits. The removed cost term
+partly masked this.
 
 ### The final formula, consolidated
 
@@ -280,21 +272,14 @@ GR(A) = H(A) / SI(A)          ( 0 if SI(A) = 0 )
 G(A)  = GR(A) · cov(A)
 ```
 
-**5. Cost-weighted score** (Núñez EG2), with `π(A)` the answerability prior
-and `cost(A) = 1 / π(A)`
+**5. Selection**
 
 ```
-ICF(A) = ( 2^{G(A)} − 1 ) / ( cost(A) + 1 )^ω
-```
-
-**6. Selection**
-
-```
-𝒜        = { category, material, color, size, style, brand, budget, feature, use_case }
+𝒜        = { material, color, size, style, budget, feature, use_case }
 exhausted = asked ∪ declined(no-preference) ∪ confirmed
-A*        = argmax_{ A ∈ 𝒜 \ exhausted, G(A) > 0 }  ICF(A)
+A*        = argmax_{ A ∈ 𝒜 \ exhausted, G(A) > 0 }  G(A)
 
-ask_attribute = A*        if  ICF(A*) > ε
+ask_attribute = A*        if  G(A*) > ε
               = "other"   else if  "other" ∉ exhausted   ( wildcard fallback )
               = None      otherwise                      ( ask nothing )
 ```
@@ -304,12 +289,10 @@ Notes:
 - `budget` is not categorical — before step 2 its values are replaced by
   log-quantile bucket labels computed across `S` (§5); with fewer than 4
   priced items it is skipped that turn (`G(budget) = 0`).
-- `category` and `brand` stay in `𝒜` but `π(category) = π(brand) ≈ 0.005`,
-  so `ICF` all but eliminates them (§1).
-- `ω` = `ENTROPY_OMEGA` (default `1.0`); `ε` = `1e-9`.
+- `category` and `brand` are not in `𝒜` at all (§1).
+- `ε` = `1e-9`.
 - Reference implementation: `starter/question_selection.py`
-  (`gain_ratio_multilabel_missing`, `information_cost_score`,
-  `choose_next_question`).
+  (`gain_ratio_multilabel_missing`, `choose_next_question`).
 
 ---
 
@@ -332,18 +315,19 @@ def bucket_budget(top_k, n_buckets=4):
 
 ## 6. Open items to validate empirically
 
-- Confirm the `answerability_prior` values on a dev sample — never
-  `data/public_set.jsonl`, which is the held-out test set. Current values
-  are estimated from the structure of `intent_card` / `classify_constraint`
-  in `evaluator/local_evaluator.py`; `category` / `brand` are pinned near
-  zero because that simulator has no branch for them.
+- Decide whether some form of answerability weighting should come back. It
+  was removed because the hand-estimated priors dominated the score, but a
+  version learned from a dev sample (counting how often each `ask_attribute`
+  actually gets a real answer) could help without the overfitting risk —
+  never tune it on `data/public_set.jsonl`, the held-out test set.
+- Address the binary-split quirk (any clean two-value attribute scores gain
+  ratio `2.0`): e.g. weight by expected pool-narrowing rather than raw gain
+  ratio, or add a small tie-break on coverage / distinct-value count.
 - Check whether joint (multi-attribute) entropy is worth the added
   complexity over independent per-attribute scoring — likely unnecessary
   since only one attribute is asked per turn.
-- Tune `omega` and the exhaustion/coverage thresholds via grid search on a
-  dev sample once Milestone 0 (baseline) is working.
-- Revisit the pool size (currently top 20) and whether `category` / `brand`
-  should be scored at all once the private-set behaviour is known.
+- Revisit the pool size and whether `category` / `brand` should re-enter the
+  candidate set once the private-set behaviour is known.
 
 ---
 
@@ -354,4 +338,3 @@ def bucket_budget(top_k, n_buckets=4):
 | Quinlan, *Induction of Decision Trees*, 1986 | https://link.springer.com/article/10.1007/BF00116251 | Base entropy / information gain formula |
 | Quinlan, *C4.5: Programs for Machine Learning*, 1993 | https://arxiv.org/pdf/2603.11117 (formulas summarized, Appendix B) | Gain Ratio (cardinality correction), missing-value handling |
 | Clare & King, *Knowledge Discovery in Multi-label Phenotype Data*, PKDD 2001 | https://www.semanticscholar.org/paper/Knowledge-Discovery-in-Multi-label-Phenotype-Data-Clare-King/e64ef24d0f6a9cefd7bf7a6b1d5f34f90ec37939 | Multi-label entropy (item has multiple attribute values) |
-| Núñez, *EG2*, *Machine Learning*, 1991 | https://www.researchgate.net/publication/261853221 | Cost-weighted attribute selection (Information Cost Function) |
