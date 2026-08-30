@@ -291,7 +291,7 @@ Notes:
   priced items it is skipped that turn (`G(budget) = 0`).
 - `category` and `brand` are not in `𝒜` at all (§1).
 - `ε` = `1e-9`.
-- Reference implementation: `starter/question_selection.py`
+- Reference implementation: `submission/question_selection.py`
   (`gain_ratio_multilabel_missing`, `choose_next_question`).
 
 ---

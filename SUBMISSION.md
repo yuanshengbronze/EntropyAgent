@@ -1,0 +1,159 @@
+# TechJam Submission Guide and Report
+
+This document describes the participant bundle rooted at this repository. The
+agent entry point is `submission/agent.py`, which exports `Agent` with the required
+`reset(...)` and `respond(...)` methods.
+
+## Submission bundle
+
+Include only these participant-owned runtime files:
+
+```text
+README.md
+SUBMISSION.md
+submission/__init__.py
+submission/agent.py
+submission/question_selection.py
+submission/semantic_index.py
+submission/precompute.py
+data/catalog_attributes.jsonl
+```
+
+The organizer-provided `data/catalog.jsonl` must be mounted or copied to that
+path before the run. Do not submit the public labels, evaluator, tests, tuning
+scripts, development results, generated SQLite caches, or any organizer-only
+files. In particular, exclude:
+
+```text
+data/public_set.jsonl
+data/catalog_fts.sqlite
+data/semantic_index.sqlite
+evaluator/
+tests/
+submission/tune_*.py
+results*.json
+```
+
+`data/catalog_attributes.jsonl` is a catalog-derived runtime asset used for
+question selection, constraints, ratings, and dynamic semantic features. It
+contains no private evaluation sessions or credentials. Confirm that its
+approximately 21 MB size is within the organizer's upload limit, because the
+published submission rules do not specify a maximum bundle size.
+
+## Runtime and setup
+
+- CPython 3.10 or newer is required; the submission was tested with CPython
+  3.14.6.
+- The runtime uses only the Python standard library. There is no `pip` install
+  step and no Python dependency manifest is required.
+- SQLite must include FTS5 support, as it does in standard CPython builds.
+- Write access beside the catalog is optional. If unavailable, the agent builds
+  its FTS table in memory instead of writing `catalog_fts.sqlite`.
+
+For a deterministic run that makes no model or network request:
+
+```bash
+OLLAMA_ENABLED=0 python -m evaluator.local_evaluator \
+  --catalog data/catalog.jsonl \
+  --dataset data/public_set.jsonl \
+  --output results.json
+```
+
+The official harness can use its private dataset in place of
+`data/public_set.jsonl`. It should import `Agent` from `submission.agent`, call
+`reset` once per session, and then call `respond` for each turn.
+
+## Method and model choice
+
+The agent uses weighted SQLite FTS5 BM25 retrieval over title, category,
+features, details, store, and description. It retains conversational query
+terms, recognizes explicit intent overrides, grounds clarification answers to
+catalog attributes, applies hard-constraint reranking, and uses a small
+review-count-smoothed rating prior. Follow-up attributes are chosen using a
+rank-weighted information-gain calculation over the current candidates.
+
+Semantic reranking is optional. The default local configuration uses
+`llama3.2:3b` to select catalog-constrained query concepts and
+`nomic-embed-text-v2-moe` for embeddings through a local Ollama HTTP endpoint.
+BM25 first creates a bounded candidate set; semantic scoring never searches the
+full catalog. A prebuilt semantic index can be generated during setup with:
+
+```bash
+python -m submission.precompute --build-embeddings
+```
+
+The generated `data/semantic_index.sqlite` is about 447 MB in the current
+development environment and is deliberately excluded from the normal
+submission bundle unless the organizer explicitly permits an artifact of that
+size.
+
+## Network and offline behavior
+
+The agent does not use an internet API and requires no API key or live
+credential. When enabled, it sends requests only to the configurable Ollama
+endpoint, which defaults to `http://localhost:11434`. Model downloads, if
+needed, are a setup-time action and should not occur during official scoring.
+
+If Ollama is disabled, unavailable, malformed, or times out, the agent falls
+back to BM25, catalog constraints, rating reranking, and token-overlap answer
+grounding. Set `OLLAMA_ENABLED=0` to select this fallback immediately and avoid
+waiting for a failed local-model request in a network-restricted environment.
+
+## Latency, token usage, and cost disclosure
+
+Measurements below were taken on the current Windows development machine on
+2026-08-30 with warm generated retrieval caches:
+
+- Offline smoke benchmark (`OLLAMA_ENABLED=0`): agent initialization plus four
+  conversational turns completed in 3.107 seconds wall-clock.
+- The recorded 200-session development run in `results.dev.json` reported
+  18,292 prompt tokens and 2,313 completion tokens, or 20,605 total generation
+  tokens (103.025 per session on average).
+- Offline fallback reports zero model tokens. Embedding token counts are not
+  included because the local Ollama embedding response does not expose them.
+- Estimated external model/API cost is USD 0.00 for the intended local Ollama
+  configuration and the offline fallback. This estimate excludes local
+  hardware, electricity, model-download bandwidth, and setup time. If
+  `OLLAMA_URL` is redirected to a billable hosted service, its provider pricing
+  must be disclosed separately before submission.
+
+Local-model latency is hardware- and cache-dependent and was not captured in
+the saved development result. The offline measurement is a warm-cache
+reference, not a claim about cold-start or Ollama latency on organizer
+hardware; a bundle that excludes generated caches will be slower on its first
+run.
+
+## Environment variables
+
+All variables are optional. Defaults reproduce the checked-in configuration.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `OLLAMA_ENABLED` | `1` | Set to `0`, `false`, or `no` for immediate offline fallback. |
+| `OLLAMA_URL` | `http://localhost:11434` | Base URL of the local Ollama server. |
+| `OLLAMA_MODEL` | `llama3.2:3b` | Local concept-selection model. |
+| `OLLAMA_EMBED_MODEL` | `nomic-embed-text-v2-moe` | Local embedding model and semantic-index identity. |
+| `OLLAMA_TIMEOUT` | `30` | Per-request timeout in seconds. |
+| `SEMANTIC_RERANK_ENABLED` | `1` | Enables semantic reranking when embeddings are available. |
+| `SEMANTIC_CANDIDATES` | `50` | Standard lexical candidate limit. |
+| `OVERRIDE_CANDIDATES` | `150` | Candidate limit immediately after an intent override. |
+| `SEMANTIC_CONFIDENCE_MARGIN` | `0.015` | Minimum top semantic-score separation. |
+| `SEMANTIC_BLEND_WEIGHT` | `0.85` | Semantic contribution to a confident rerank. |
+| `SEMANTIC_EXPANSION_WEIGHT` | `0.20` | Contribution from model-selected concept expansions. |
+| `BM25_WEIGHTS` | `0,4.5,4,2.5,2.5,1.5,1` | Seven non-negative FTS column weights. |
+| `CATALOG_FTS_PATH` | beside catalog | Generated FTS cache location. |
+| `CATALOG_ATTRIBUTES_PATH` | `data/catalog_attributes.jsonl` | Structured attribute catalog. |
+| `CLEAN_CATALOG_PATH` | `data/catalog_attributes.jsonl` | Dynamic semantic-concept catalog. |
+| `SEMANTIC_INDEX_PATH` | beside clean catalog | Optional persisted semantic index. |
+
+## Known limitations
+
+- The offline fallback loses semantic synonym matching and model-selected query
+  expansion, so retrieval quality can be lower than the local-model path.
+- Without a persisted semantic index, the local-model path embeds only current
+  candidate concepts at runtime, which increases cold-start latency.
+- Intent and attribute parsing is primarily English and uses curated patterns.
+- Question quality depends on coverage and cleanliness of the derived catalog
+  attributes; missing metadata is treated as unknown rather than conflicting.
+- The generated FTS cache is an optimization. Read-only environments remain
+  correct but may have higher initialization time and memory use.

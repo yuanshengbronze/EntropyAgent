@@ -14,14 +14,14 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from starter.question_selection import (
+from submission.question_selection import (
     ASKABLE_ATTRIBUTES,
     choose_next_question,
     gain_ratio_multilabel_missing,
     ground_answer,
     normalize_attributes,
 )
-from starter.semantic_index import concepts_for_item, file_sha256
+from submission.semantic_index import concepts_for_item, file_sha256
 
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
@@ -68,7 +68,6 @@ ENTROPY_POOL_SIZE = 20
 MAX_TURNS = 10
 MAX_CANDIDATE_CONCEPTS = 60
 MAX_QUERY_CONCEPTS = 8
-MAX_DOCUMENT_CONCEPTS = 16
 EMBED_BATCH_SIZE = 96
 # A semantic context score is only trusted when it separates the best candidate
 # from the rest. This prevents a weak or generic context from reshuffling a
@@ -156,6 +155,7 @@ ATTRIBUTE_HINTS = {
     ),
     "budget": re.compile(r"(?:\bbudget\b|\bprice\b|\bunder\s+\$?\d|\$\s*\d)", re.IGNORECASE),
 }
+OLLAMA_ERRORS = (HTTPError, URLError, OSError, TimeoutError, TypeError, ValueError)
 
 
 def _text(value: object) -> str:
@@ -250,7 +250,9 @@ class Agent:
         self.llm_model = os.environ.get("OLLAMA_MODEL", "llama3.2:3b")
         self.embedding_model = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text-v2-moe")
         self.ollama_timeout = int(os.environ.get("OLLAMA_TIMEOUT", "30"))
-        self._llm_available = os.environ.get("OLLAMA_ENABLED", "1").lower() not in {"0", "false", "no"}
+        self._llm_available = os.environ.get("OLLAMA_ENABLED", "1").lower() not in {
+            "0", "false", "no",
+        }
         self._embedding_available = self._llm_available
         self.semantic_rerank_enabled = (
             os.environ.get("SEMANTIC_RERANK_ENABLED", "1").lower() not in {"0", "false", "no"}
@@ -267,14 +269,18 @@ class Agent:
     def _open_fts_cache(self) -> sqlite3.Connection:
         """Open a catalog-fingerprinted FTS cache, building it only once."""
         configured = os.environ.get("CATALOG_FTS_PATH")
-        cache_path = Path(configured) if configured else self.catalog_path.with_name("catalog_fts.sqlite")
+        cache_path = (
+            Path(configured)
+            if configured
+            else self.catalog_path.with_name("catalog_fts.sqlite")
+        )
         fingerprint = file_sha256(self.catalog_path)
         if cache_path.exists():
             try:
                 cached = sqlite3.connect(f"file:{cache_path.resolve()}?mode=ro", uri=True)
                 metadata = dict(cached.execute("SELECT key, value FROM metadata"))
                 if metadata.get("source_sha256") == fingerprint:
-                    return cached 
+                    return cached
                 cached.close()
             except (OSError, sqlite3.DatabaseError):
                 pass
@@ -289,7 +295,9 @@ class Agent:
             building = sqlite3.connect(temporary_path)
             try:
                 self._build_fts_cache(building)
-                building.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                building.execute(
+                    "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
                 building.executemany(
                     "INSERT INTO metadata(key, value) VALUES (?, ?)",
                     (("source_sha256", fingerprint),),
@@ -315,7 +323,12 @@ class Agent:
         )
         batch: list[tuple[str, str, str, str, str, str, str]] = []
         for product in _jsonl(self.catalog_path):
-            batch.append((str(product["parent_asin"]), *(_text(product.get(key)) for key in SEARCH_FIELDS)))
+            batch.append(
+                (
+                    str(product["parent_asin"]),
+                    *(_text(product.get(key)) for key in SEARCH_FIELDS),
+                )
+            )
             if len(batch) >= 1000:
                 cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
                 batch.clear()
@@ -354,7 +367,12 @@ class Agent:
         if not clean_path.exists():
             return
 
-        semantic_path = Path(os.environ.get("SEMANTIC_INDEX_PATH", clean_path.with_name("semantic_index.sqlite")))
+        semantic_path = Path(
+            os.environ.get(
+                "SEMANTIC_INDEX_PATH",
+                clean_path.with_name("semantic_index.sqlite"),
+            )
+        )
         if semantic_path.exists():
             try:
                 connection = sqlite3.connect(f"file:{semantic_path.resolve()}?mode=ro", uri=True)
@@ -382,7 +400,11 @@ class Agent:
         """Load only current-candidate concepts from the persisted index."""
         if self._semantic_connection is None:
             return
-        missing = [parent_asin for parent_asin, _ in rows if parent_asin not in self._semantic_loaded_asins]
+        missing = [
+            parent_asin
+            for parent_asin, _ in rows
+            if parent_asin not in self._semantic_loaded_asins
+        ]
         if not missing:
             return
         placeholders = ", ".join("?" for _ in missing)
@@ -417,7 +439,11 @@ class Agent:
     def _load_attribute_index(self) -> None:
         """Load question attributes and rating metadata from the flat catalog."""
         configured = os.environ.get("CATALOG_ATTRIBUTES_PATH")
-        path = Path(configured) if configured else self.catalog_path.with_name("catalog_attributes.jsonl")
+        path = (
+            Path(configured)
+            if configured
+            else self.catalog_path.with_name("catalog_attributes.jsonl")
+        )
         if not path.exists():
             return
         for row in _jsonl(path):
@@ -465,7 +491,7 @@ class Agent:
                 "prompt_tokens": max(0, int(envelope.get("prompt_eval_count", 0))),
                 "completion_tokens": max(0, int(envelope.get("eval_count", 0))),
             }
-        except (HTTPError, URLError, OSError, TimeoutError, TypeError, ValueError, json.JSONDecodeError):
+        except OLLAMA_ERRORS:
             self._llm_available = False
             return None, {"prompt_tokens": 0, "completion_tokens": 0}
 
@@ -473,10 +499,12 @@ class Agent:
         """Resolve persisted vectors first, embedding only genuinely new text."""
         self._load_persisted_embeddings(texts)
         missing = list(dict.fromkeys(text for text in texts if text not in self.embedding_cache))
-        if not missing:
-            return {text: self.embedding_cache[text] for text in texts if text in self.embedding_cache}
-        if not self._embedding_available:
-            return {text: self.embedding_cache[text] for text in texts if text in self.embedding_cache}
+        if not missing or not self._embedding_available:
+            return {
+                text: self.embedding_cache[text]
+                for text in texts
+                if text in self.embedding_cache
+            }
         try:
             for start in range(0, len(missing), EMBED_BATCH_SIZE):
                 batch = missing[start:start + EMBED_BATCH_SIZE]
@@ -490,7 +518,7 @@ class Agent:
                     if not isinstance(vector, list) or not vector:
                         raise ValueError("invalid embedding vector")
                     self.embedding_cache[text] = [float(value) for value in vector]
-        except (HTTPError, URLError, OSError, TimeoutError, TypeError, ValueError, json.JSONDecodeError):
+        except OLLAMA_ERRORS:
             # The completion model may not support embeddings. BM25 still works.
             self._embedding_available = False
             return None
@@ -614,7 +642,10 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
                 scores.append(direct_score)
                 continue
             expansion_maxima = [
-                max(sum(a * b for a, b in zip(vectors[query], vectors[document])) for document in concepts)
+                max(
+                    sum(a * b for a, b in zip(vectors[query], vectors[document]))
+                    for document in concepts
+                )
                 for query in available_expansions
             ]
             expansion_score = sum(expansion_maxima) / len(expansion_maxima)
@@ -726,7 +757,11 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
             for constraint in constraints:
                 attribute = constraint["attribute"]
                 wanted = constraint["values"]
-                have = {str(value).casefold() for value in attrs.get(attribute, [])} if attribute else set()
+                have = (
+                    {str(value).casefold() for value in attrs.get(attribute, [])}
+                    if attribute
+                    else set()
+                )
                 if have and wanted:
                     match = float(any(
                         _attribute_value_matches(have_value, wanted_value)
@@ -764,7 +799,11 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
             matched, rejected = [], []
             for row in rescored:
                 (rejected if conflicts_with_confirmed(row) else matched).append(row)
-            rescored = matched if session["route"] == "buying" and len(matched) >= top_k else matched + rejected
+            rescored = (
+                matched
+                if session["route"] == "buying" and len(matched) >= top_k
+                else matched + rejected
+            )
         return rescored, {"active_constraints": len(constraints), "typed_conflicts": conflicts}
 
     def _entropy_attribute(
@@ -776,7 +815,11 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
         """Choose the question with the greatest expected posterior rank reduction."""
         if turn >= MAX_TURNS or not self.attributes_by_asin:
             return None, 0.0
-        candidate_rows = [row for row in rows[:ENTROPY_POOL_SIZE] if row[0] in self.attributes_by_asin]
+        candidate_rows = [
+            row
+            for row in rows[:ENTROPY_POOL_SIZE]
+            if row[0] in self.attributes_by_asin
+        ]
         pool = [self.attributes_by_asin[parent_asin] for parent_asin, _ in candidate_rows]
         if not pool:
             return None, 0.0
@@ -830,7 +873,11 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
         ]
         if not pool:
             return False
-        embed_fn = self._embed if self._embedding_available or self._semantic_connection is not None else None
+        embed_fn = (
+            self._embed
+            if self._embedding_available or self._semantic_connection is not None
+            else None
+        )
         grounded = ground_answer(answer, attribute, pool, embed_fn=embed_fn)
         changed = False
         for slot, values in grounded.items():
@@ -869,8 +916,8 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
         near-zero weight so relevance remains the deciding factor.
         """
         style = str(profile.get("rating_style", "")).casefold()
-        prior_rating = _finite_number(profile.get("average_prior_rating"))
         if style == "critical":
+            prior_rating = _finite_number(profile.get("average_prior_rating"))
             return 0.65 if prior_rating is not None and prior_rating <= 2.0 else 0.50
         if style == "mixed":
             return 0.12
@@ -891,7 +938,11 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
         smoothed = RATING_PRIOR + (rating - RATING_PRIOR) * confidence
         return max(0.0, min(1.0, (smoothed - 3.5) / 1.5))
 
-    def _apply_profile_rating(self, rows: list[tuple[str, float]], profile: dict) -> list[tuple[str, float]]:
+    def _apply_profile_rating(
+        self,
+        rows: list[tuple[str, float]],
+        profile: dict,
+    ) -> list[tuple[str, float]]:
         """Rerank retrieved products using rating sensitivity, without retrieval IO.
 
         ``rows`` are already BM25/semantic candidates.  This method only
@@ -925,6 +976,16 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
         explicit = EXPLICIT_ATTRIBUTE_RE.match(text)
         if explicit:
             raw_attribute, value_text = explicit.groups()
+        else:
+            value_text = text
+
+        hinted = [
+            attribute
+            for attribute, pattern in ATTRIBUTE_HINTS.items()
+            if pattern.search(value_text)
+        ]
+        hinted_attributes = set(hinted)
+        if explicit:
             normalized_attribute = raw_attribute.casefold().replace("_", " ")
             attribute = ATTRIBUTE_ALIASES.get(
                 normalized_attribute,
@@ -932,12 +993,6 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
             )
             candidate_attributes = (attribute,) if attribute in self.attribute_values else ()
         else:
-            value_text = text
-            hinted = [
-                attribute
-                for attribute, pattern in ATTRIBUTE_HINTS.items()
-                if pattern.search(value_text)
-            ]
             remaining = [
                 attribute
                 for attribute in ASKABLE_ATTRIBUTES
@@ -953,11 +1008,6 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
         best_attribute: str | None = None
         best_score = 0.0
         best_values: set[str] = set()
-        hinted_attributes = {
-            attribute
-            for attribute, pattern in ATTRIBUTE_HINTS.items()
-            if pattern.search(value_text)
-        }
         for attribute in candidate_attributes:
             attribute_best = 0.0
             attribute_values: set[str] = set()
@@ -998,9 +1048,15 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
             return fallback, set()
         return best_attribute, set(sorted(best_values)[:6])
 
-    def _record_message_terms(self, session: dict, message: str) -> bool:
+    def _record_message_terms(
+        self,
+        session: dict,
+        message: str,
+        is_override: bool | None = None,
+    ) -> bool:
         """Add a turn to retrieval state, retiring superseded preferences."""
-        is_override = bool(OVERRIDE_RE.search(message))
+        if is_override is None:
+            is_override = bool(OVERRIDE_RE.search(message))
         if is_override:
             # Keep the category disclosed in the opening turn, but retire every
             # prior positive preference before rebuilding retrieval state. A
@@ -1015,8 +1071,9 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
             session["pending_attribute"] = None
             value = OVERRIDE_VALUE_RE.search(message)
             text = value.group(1) if value else message
-            terms = _terms(text)
-            session["term_groups"].append({"text": text, "terms": terms, "kind": "requirement"})
+            session["term_groups"].append(
+                {"text": text, "terms": _terms(text), "kind": "requirement"}
+            )
             attribute, values = self._infer_override_constraint(text)
             if attribute is not None:
                 session["no_preference_attributes"].discard(attribute)
@@ -1050,7 +1107,8 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
                 )
             direct = KEY_REQUIREMENT_RE.search(message)
             if direct:
-                self._add_constraint(session, text=next(value for value in direct.groups() if value))
+                requirement = next(value for value in direct.groups() if value)
+                self._add_constraint(session, text=requirement)
         else:
             session["term_groups"].append(
                 {"text": message, "terms": _terms(message), "kind": "preference"}
@@ -1142,12 +1200,13 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
                     shown_parent_asins,
                 )
                 rows = self._apply_profile_rating(rows, session["profile"])
-                rows, constraint_diagnostics = self._apply_constraints(rows, session, evidence, top_k)
+                rows, constraint_diagnostics = self._apply_constraints(
+                    rows, session, evidence, top_k
+                )
                 diagnostics["lexical_candidates"] = len(rows)
                 diagnostics.update(constraint_diagnostics)
         else:
-            is_override_message = self._record_message_terms(session, user_message)
-            diagnostics["override"] = is_override_message
+            self._record_message_terms(session, user_message, is_override_message)
             expression = " OR ".join(f'"{term}"' for term in session["active_terms"])
             if not expression:
                 rows: list[tuple[str, float]] = []
@@ -1171,7 +1230,12 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
             should_semantic_rerank = (
                 self.semantic_rerank_enabled
                 and bool(rows)
-                and (turn <= 2 or grounded_changed or is_override_message or bool(_terms(user_message)))
+                and (
+                    turn <= 2
+                    or grounded_changed
+                    or is_override_message
+                    or bool(_terms(user_message))
+                )
             )
             diagnostics["semantic_requested"] = should_semantic_rerank
             if should_semantic_rerank:
@@ -1181,12 +1245,16 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
                 direct_queries = self._direct_semantic_queries(session)
                 query_concepts: list[str] = []
                 if candidate_concepts and SEMANTIC_EXPANSION_WEIGHT > 0.0:
-                    query_concepts, usage = self._select_query_concepts(conversation, candidate_concepts)
+                    query_concepts, usage = self._select_query_concepts(
+                        conversation, candidate_concepts
+                    )
                 diagnostics["semantic_direct_queries"] = len(direct_queries)
                 diagnostics["semantic_expansions"] = len(query_concepts)
                 semantic_scores = self._semantic_scores(direct_queries, query_concepts, rows)
                 if semantic_scores is not None:
-                    diagnostics["semantic_confident"] = self._semantic_is_confident(semantic_scores)
+                    diagnostics["semantic_confident"] = self._semantic_is_confident(
+                        semantic_scores
+                    )
                     if diagnostics["semantic_confident"]:
                         base_scores = _z_scores([score for _, score in rows])
                         combined = [
@@ -1221,7 +1289,8 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
         if ask_attribute == "other":
             message = "Is there any other detail that matters for what you need?"
         elif ask_attribute:
-            message = f"I found some close matches. Any preference on {ask_attribute.replace('_', ' ')}?"
+            display_attribute = ask_attribute.replace("_", " ")
+            message = f"I found some close matches. Any preference on {display_attribute}?"
         else:
             message = "Here are the closest matches I found."
         return {

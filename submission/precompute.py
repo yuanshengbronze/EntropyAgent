@@ -7,8 +7,8 @@ offline step, so the shopping agent does not have to call an LLM per catalog
 item or rediscover product facts at query time.
 
 Example:
-    python starter/precompute.py --limit 5 --progress-every 1
-    python starter/precompute.py --output data/clean_catalog.jsonl
+    python -m submission.precompute --limit 5 --progress-every 1
+    python -m submission.precompute --output data/clean_catalog.jsonl
 
 Ollama must be running locally.  The default llama3.2:3b model works on CPU;
 set --model or OLLAMA_MODEL to use another installed Ollama model.
@@ -28,8 +28,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 try:
-    from starter.semantic_index import concepts_for_item, file_sha256
-except ModuleNotFoundError:  # Supports `python starter/precompute.py` as documented.
+    from submission.semantic_index import concepts_for_item, file_sha256
+except ModuleNotFoundError:  # Supports direct script execution as a fallback.
     from semantic_index import concepts_for_item, file_sha256
 
 
