@@ -221,7 +221,7 @@ def build_embedding_index(
     )
     connection.execute("CREATE INDEX IF NOT EXISTS product_concepts_asin ON product_concepts(parent_asin)")
     metadata = dict(connection.execute("SELECT key, value FROM metadata"))
-    expected = {"schema_version": "2", "source_sha256": source_hash, "embedding_model": model}
+    expected = {"source_sha256": source_hash, "embedding_model": model}
     if metadata and any(metadata.get(key) != value for key, value in expected.items()):
         connection.close()
         raise RuntimeError(
