@@ -55,6 +55,9 @@ STOPWORDS = {
     "i", "in", "is", "it", "me", "my", "of", "on", "or", "please", "some",
     "that", "the", "this", "to", "want", "with", "would", "you", "looking",
 }
+MISSING_CONCEPT_VALUES = {
+    "unknown", "n/a", "none", "not available", "not specified", "unspecified",
+}
 DEFAULT_SEMANTIC_CANDIDATES = 50
 SEMANTIC_CANDIDATES = int(
     os.environ.get("SEMANTIC_CANDIDATES", str(DEFAULT_SEMANTIC_CANDIDATES))
@@ -70,6 +73,12 @@ EMBED_BATCH_SIZE = 96
 # useful lexical ranking.
 SEMANTIC_CONFIDENCE_MARGIN = float(os.environ.get("SEMANTIC_CONFIDENCE_MARGIN", "0.015"))
 SEMANTIC_BLEND_WEIGHT = float(os.environ.get("SEMANTIC_BLEND_WEIGHT", "0.85"))
+# Catalog-constrained LLM concepts can expand the shopper's wording, but must
+# not replace it.  The direct conversation remains the primary semantic signal.
+DEFAULT_SEMANTIC_EXPANSION_WEIGHT = 0.20
+SEMANTIC_EXPANSION_WEIGHT = float(
+    os.environ.get("SEMANTIC_EXPANSION_WEIGHT", str(DEFAULT_SEMANTIC_EXPANSION_WEIGHT))
+)
 HARD_CONSTRAINT_BONUS = 1.40
 HARD_CONSTRAINT_PENALTY = 2.20
 QUESTION_CONFIDENCE_TEMPERATURE = 0.85
@@ -123,6 +132,12 @@ def _terms(text: str) -> list[str]:
         for token in TOKEN_RE.findall(text)
         if len(token) > 1 and token.lower() not in STOPWORDS
     ]
+
+
+def _informative_concept(concept: str) -> bool:
+    """Exclude missing-value placeholders from semantic retrieval signals."""
+    _, separator, value = concept.partition(":")
+    return not separator or value.strip().casefold() not in MISSING_CONCEPT_VALUES
 
 
 def _z_scores(values: list[float]) -> list[float]:
@@ -423,7 +438,12 @@ class Agent:
         """Pseudo-relevance feedback: frequent concepts from BM25's top hits."""
         counts: Counter[str] = Counter()
         for parent_asin, _ in rows:
-            counts.update(dict.fromkeys(self.concepts_by_asin.get(parent_asin, []), 1))
+            concepts = (
+                concept
+                for concept in self.concepts_by_asin.get(parent_asin, [])
+                if _informative_concept(concept)
+            )
+            counts.update(dict.fromkeys(concepts, 1))
         return [concept for concept, _ in counts.most_common(MAX_CANDIDATE_CONCEPTS)]
 
     def _select_query_concepts(
@@ -453,32 +473,76 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
         selected = list(dict.fromkeys(selected))[:MAX_QUERY_CONCEPTS]
         return selected, usage
 
-    def _semantic_scores(self, query_concepts: list[str], rows: list[tuple[str, float]]) -> list[float] | None:
-        if not query_concepts:
+    @staticmethod
+    def _direct_semantic_queries(session: dict) -> list[str]:
+        """Keep the shopper's own active wording as the primary semantic query."""
+        categories = [
+            f"category: {group['text']}"
+            for group in session["term_groups"]
+            if group["kind"] == "category" and group["text"]
+        ]
+        preferences = [
+            f"shopper request: {group['text']}"
+            for group in session["term_groups"]
+            if group["kind"] == "preference" and group["text"]
+        ][-5:]
+        confirmed = [
+            f"required {attribute}: {value}"
+            for attribute, values in session["confirmed"].items()
+            for value in sorted(values)
+        ]
+        return list(dict.fromkeys([*categories, *preferences, *confirmed]))
+
+    def _semantic_scores(
+        self,
+        direct_queries: list[str],
+        query_concepts: list[str],
+        rows: list[tuple[str, float]],
+    ) -> list[float] | None:
+        if not direct_queries:
             return None
         document_concepts = list(dict.fromkeys(
             concept for parent_asin, _ in rows
             for concept in self.concepts_by_asin.get(parent_asin, [])
+            if _informative_concept(concept)
         ))
-        embeddings = self._embed([*query_concepts, *document_concepts])
-        if embeddings is None or any(concept not in embeddings for concept in query_concepts):
+        embeddings = self._embed([*direct_queries, *query_concepts, *document_concepts])
+        if embeddings is None or any(query not in embeddings for query in direct_queries):
             return None
         # Normalizing once avoids recalculating two vector norms for every
         # query/document pair (thousands of pairs per rerank).
         vectors = {text: _unit(vector) for text, vector in embeddings.items()}
         scores: list[float] = []
         for parent_asin, _ in rows:
-            concepts = [concept for concept in self.concepts_by_asin.get(parent_asin, []) if concept in vectors]
+            concepts = [
+                concept
+                for concept in self.concepts_by_asin.get(parent_asin, [])
+                if _informative_concept(concept) and concept in vectors
+            ]
             if not concepts:
                 scores.append(0.0)
                 continue
-            # SemRank's multi-vector score: each query concept matches its most
-            # similar document concept, then those maxima are averaged.
-            maxima = [
+            # The shopper's own words always determine most of the score. Each
+            # direct query fragment matches its closest document concept.
+            direct_maxima = [
                 max(sum(a * b for a, b in zip(vectors[query], vectors[document])) for document in concepts)
-                for query in query_concepts
+                for query in direct_queries
             ]
-            scores.append(sum(maxima) / len(maxima))
+            direct_score = sum(direct_maxima) / len(direct_maxima)
+
+            available_expansions = [query for query in query_concepts if query in vectors]
+            if not available_expansions:
+                scores.append(direct_score)
+                continue
+            expansion_maxima = [
+                max(sum(a * b for a, b in zip(vectors[query], vectors[document])) for document in concepts)
+                for query in available_expansions
+            ]
+            expansion_score = sum(expansion_maxima) / len(expansion_maxima)
+            scores.append(
+                (1.0 - SEMANTIC_EXPANSION_WEIGHT) * direct_score
+                + SEMANTIC_EXPANSION_WEIGHT * expansion_score
+            )
         return scores
 
     @staticmethod
@@ -890,20 +954,24 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
             if should_semantic_rerank:
                 self._ensure_candidate_concepts(rows)
                 candidate_concepts = self._candidate_concepts(rows)
-                if candidate_concepts:
-                    conversation = [group["text"] for group in session["term_groups"]]
+                conversation = [group["text"] for group in session["term_groups"]]
+                direct_queries = self._direct_semantic_queries(session)
+                query_concepts: list[str] = []
+                if candidate_concepts and SEMANTIC_EXPANSION_WEIGHT > 0.0:
                     query_concepts, usage = self._select_query_concepts(conversation, candidate_concepts)
-                    semantic_scores = self._semantic_scores(query_concepts, rows)
-                    if semantic_scores is not None:
-                        diagnostics["semantic_confident"] = self._semantic_is_confident(semantic_scores)
-                        if diagnostics["semantic_confident"]:
-                            base_scores = _z_scores([score for _, score in rows])
-                            combined = [
-                                base + SEMANTIC_BLEND_WEIGHT * semantic
-                                for base, semantic in zip(base_scores, _z_scores(semantic_scores))
-                            ]
-                            rows = self._rerank(rows, combined)
-                            diagnostics["semantic_used"] = True
+                diagnostics["semantic_direct_queries"] = len(direct_queries)
+                diagnostics["semantic_expansions"] = len(query_concepts)
+                semantic_scores = self._semantic_scores(direct_queries, query_concepts, rows)
+                if semantic_scores is not None:
+                    diagnostics["semantic_confident"] = self._semantic_is_confident(semantic_scores)
+                    if diagnostics["semantic_confident"]:
+                        base_scores = _z_scores([score for _, score in rows])
+                        combined = [
+                            base + SEMANTIC_BLEND_WEIGHT * semantic
+                            for base, semantic in zip(base_scores, _z_scores(semantic_scores))
+                        ]
+                        rows = self._rerank(rows, combined)
+                        diagnostics["semantic_used"] = True
             rows = self._apply_profile_rating(rows, session["profile"])
             rows, constraint_diagnostics = self._apply_constraints(rows, session, evidence, top_k)
             diagnostics.update(constraint_diagnostics)
