@@ -7,8 +7,8 @@ offline step, so the shopping agent does not have to call an LLM per catalog
 item or rediscover product facts at query time.
 
 Example:
-    python -m submission.precompute --limit 5 --progress-every 1
-    python -m submission.precompute --output data/clean_catalog.jsonl
+    python -m submission.src.precompute --limit 5 --progress-every 1
+    python -m submission.src.precompute --output data/clean_catalog.jsonl
 
 Ollama must be running locally.  The default llama3.2:3b model works on CPU;
 set --model or OLLAMA_MODEL to use another installed Ollama model.
@@ -28,8 +28,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 try:
-    from submission.semantic_index import concepts_for_item, file_sha256
-except ModuleNotFoundError:  # Supports direct script execution as a fallback.
+    from .semantic_index import concepts_for_item, file_sha256
+except ImportError:  # Supports direct script execution as a fallback.
     from semantic_index import concepts_for_item, file_sha256
 
 
@@ -307,7 +307,9 @@ def main() -> None:
         "--build-embeddings", action="store_true", help="Build/resume a persistent semantic index, then exit."
     )
     parser.add_argument(
-        "--embedding-input", default="data/catalog_attributes.jsonl", help="Structured catalog JSONL to embed."
+        "--embedding-input",
+        default="submission/assets/catalog_attributes.jsonl",
+        help="Structured catalog JSONL to embed.",
     )
     parser.add_argument(
         "--embedding-output", default="data/semantic_index.sqlite", help="Persistent semantic SQLite index."

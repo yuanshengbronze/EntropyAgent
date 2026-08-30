@@ -12,8 +12,8 @@ Does NOT touch data/public_set.jsonl.
 
 from __future__ import annotations
 
-from starter.agent import Agent, ENTROPY_POOL_SIZE
-from starter.question_selection import ASKABLE_ATTRIBUTES, gain_ratio_multilabel_missing
+from submission.agent import Agent, ENTROPY_POOL_SIZE
+from submission.src.question_selection import ASKABLE_ATTRIBUTES, gain_ratio_multilabel_missing
 
 # (message, turn). Edit freely - these are not real sessions, just probes.
 SCENARIO = [

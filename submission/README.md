@@ -1,0 +1,164 @@
+# TechJam Agent Submission
+
+This directory is the participant runtime bundle. `agent.py` is the required
+entry point and exports `Agent.reset(...)` and `Agent.respond(...)` using the
+competition contract.
+
+## Contents
+
+```text
+submission/
+  agent.py
+  requirements.txt
+  README.md
+  assets/
+    catalog_attributes.jsonl
+  src/
+    __init__.py
+    extract_product_attributes.py
+    precompute.py
+    question_selection.py
+    semantic_index.py
+```
+
+`catalog_attributes.jsonl` is a deterministic derivative of the frozen public
+catalog. It contains product attributes only; it does not contain public or
+private session labels, user data, evaluator code, or credentials.
+
+## Requirements
+
+- CPython 3.10 or newer
+- SQLite compiled with FTS5 support
+- No third-party Python dependencies
+- The organizer-provided frozen catalog available to the harness
+
+The dependency-installation command is intentionally a no-op apart from
+validating the manifest:
+
+```bash
+python -m pip install -r submission/requirements.txt
+```
+
+## Harness integration
+
+Preferred package import from the repository root:
+
+```python
+from submission.agent import Agent
+
+agent = Agent("data/catalog.jsonl")  # use the organizer-mounted catalog path
+```
+
+For harnesses that add `submission/` directly to `sys.path`, this is also
+supported:
+
+```python
+from agent import Agent
+```
+
+Call `reset(session_id, user_profile)` once at the start of a session, then
+call `respond(session_id, user_message, turn, top_k=10)` for each turn.
+
+## Offline mode
+
+The agent can run using only deterministic BM25 retrieval and catalog-grounded
+rules. Set this before starting the organizer's harness:
+
+```bash
+export OLLAMA_ENABLED=0
+```
+
+PowerShell equivalent:
+
+```powershell
+$env:OLLAMA_ENABLED = "0"
+```
+
+When this directory is placed in the organizer's development checkout, run the
+public harness with:
+
+```bash
+python -m evaluator.local_evaluator \
+  --catalog data/catalog.jsonl \
+  --dataset data/public_set.jsonl \
+  --output results.json
+```
+
+The evaluator, raw catalog, and public sessions are organizer-provided inputs
+and are intentionally not included in this bundle. The organizer can use the
+same `Agent` interface with its private evaluation set.
+
+## Optional local semantic reranking
+
+With a local Ollama service, the defaults use `llama3.2:3b` for constrained
+query-concept selection and `nomic-embed-text-v2-moe` for embeddings. No API
+key or internet service is used during evaluation. If Ollama is unavailable or
+disabled, the agent falls back automatically to its deterministic path.
+
+## Method, model, and cost summary
+
+The agent retrieves a bounded candidate pool with field-weighted SQLite FTS5
+BM25, then applies structured conversational constraints and a small
+review-count-smoothed quality prior. It selects follow-up attributes using
+rank-weighted information gain over current candidates and explicitly resets
+stale state after an intent override. When local Ollama models are available,
+catalog-grounded query concepts and embeddings may rerank the lexical pool;
+semantic scores are used only when their confidence margin is sufficient.
+
+The default optional local models are `llama3.2:3b` and
+`nomic-embed-text-v2-moe`. The intended configuration uses no billable external
+API, so estimated external model cost is USD 0.00. The recorded 200-session
+development run used 18,292 prompt tokens and 2,313 completion tokens. A warm
+offline initialization plus four-turn smoke run took 3.107 seconds on the
+development machine; organizer-hardware and cold-start latency may differ.
+
+## Demonstrated multi-turn session
+
+The catalog-only `smoke_check.py` produced the following abbreviated offline
+session with `OLLAMA_ENABLED=0`:
+
+```text
+User:  I need a men's rain jacket. A key requirement is: waterproof.
+Agent: I found some close matches. Any preference on feature?
+       Top result: B07TGH64XN
+
+User:  For that, what matters is: sealed seams; packable.
+Agent: I found some close matches. Any preference on material?
+       Top result: B07QS6GYN6
+
+User:  I'd like it in navy.
+Agent: I found some close matches. Any preference on style?
+       Top result: B071W1LMX7
+
+User:  I don't have a preference for that; use your judgment.
+Agent: I found some close matches. Any preference on use case?
+       Top result: B0089Q0XBS
+```
+
+## Known limitations
+
+- The deterministic fallback handles semantic synonyms less effectively than
+  the optional local embedding path.
+- Intent and attribute parsing is primarily English and pattern-assisted.
+- Missing or noisy catalog metadata can reduce question and constraint quality.
+- The first run is slower when the generated FTS cache is absent.
+- Local-model latency depends on available hardware and model caches.
+
+## Team contributions
+
+The development-branch history records Elbert's work on catalog preprocessing,
+hybrid retrieval, conversational state, tuning, integration, and submission
+packaging, and KelvenN11's work on entropy-based clarification and its scoring
+refinements. Add any non-code contributions not represented in Git history
+before the final submission.
+
+## Rebuilding the bundled attribute asset
+
+```bash
+python -m submission.src.extract_product_attributes \
+  --input data/catalog.jsonl \
+  --output submission/assets/catalog_attributes.jsonl
+```
+
+The full architecture and evaluation breakdown are documented in the
+repository-level `README.md` and `SUBMISSION.md`.

@@ -1,28 +1,37 @@
 # TechJam Submission Guide and Report
 
-This document describes the participant bundle rooted at this repository. The
-agent entry point is `submission/agent.py`, which exports `Agent` with the required
+This document describes the participant bundle in `submission/`. The agent
+entry point is `submission/agent.py`, which exports `Agent` with the required
 `reset(...)` and `respond(...)` methods.
 
 ## Submission bundle
 
-Include only these participant-owned runtime files:
+Upload the `submission/` directory with these participant-owned runtime files:
 
 ```text
-README.md
-SUBMISSION.md
 submission/__init__.py
 submission/agent.py
-submission/question_selection.py
-submission/semantic_index.py
-submission/precompute.py
-data/catalog_attributes.jsonl
+submission/README.md
+submission/requirements.txt
+submission/assets/catalog_attributes.jsonl
+submission/src/__init__.py
+submission/src/extract_product_attributes.py
+submission/src/question_selection.py
+submission/src/semantic_index.py
+submission/src/precompute.py
 ```
 
-The organizer-provided `data/catalog.jsonl` must be mounted or copied to that
-path before the run. Do not submit the public labels, evaluator, tests, tuning
-scripts, development results, generated SQLite caches, or any organizer-only
-files. In particular, exclude:
+The submission-specific `submission/README.md` is self-contained and includes
+setup, harness integration, method/model choice, cost, limitations, a
+multi-turn demonstration, and team contributions. The repository-level
+`README.md` and `SUBMISSION.md` provide additional project detail but are not
+required by the runtime bundle.
+
+The repository does not include `data/`, `evaluator/`, `tests/`, or `docs/`.
+The organizer-provided frozen catalog must be mounted or copied to a path that
+is passed to `Agent(...)`. Do not submit public labels, the evaluator, tests,
+tuning scripts, development results, generated SQLite caches, or copied
+organizer documentation. In particular, exclude:
 
 ```text
 data/public_set.jsonl
@@ -30,38 +39,60 @@ data/catalog_fts.sqlite
 data/semantic_index.sqlite
 evaluator/
 tests/
-submission/tune_*.py
+docs/
+tools/
 results*.json
 ```
 
-`data/catalog_attributes.jsonl` is a catalog-derived runtime asset used for
-question selection, constraints, ratings, and dynamic semantic features. It
-contains no private evaluation sessions or credentials. Confirm that its
-approximately 21 MB size is within the organizer's upload limit, because the
-published submission rules do not specify a maximum bundle size.
+The bundle includes `submission/assets/catalog_attributes.jsonl`, generated
+deterministically from the public frozen catalog. It contains no development
+session labels, private evaluation data, user data, or credentials. Reproduce
+or refresh it with:
+
+```bash
+python -m submission.src.extract_product_attributes \
+  --input data/catalog.jsonl \
+  --output submission/assets/catalog_attributes.jsonl
+```
+
+This asset powers question selection, constraints, ratings, and dynamic
+semantic features. The published rules allow lightweight local assets required
+by the agent and do not state a bundle-size limit; confirm the approximately
+20.9 MB file is accepted by the actual submission portal.
 
 ## Runtime and setup
 
 - CPython 3.10 or newer is required; the submission was tested with CPython
   3.14.6.
-- The runtime uses only the Python standard library. There is no `pip` install
-  step and no Python dependency manifest is required.
+- The runtime uses only the Python standard library. The included
+  `submission/requirements.txt` records that there are no third-party
+  dependencies; running `pip install -r` therefore installs nothing.
 - SQLite must include FTS5 support, as it does in standard CPython builds.
 - Write access beside the catalog is optional. If unavailable, the agent builds
   its FTS table in memory instead of writing `catalog_fts.sqlite`.
 
-For a deterministic run that makes no model or network request:
+For a deterministic run that makes no model or network request, set
+`OLLAMA_ENABLED=0` before starting the organizer-provided harness:
 
 ```bash
-OLLAMA_ENABLED=0 python -m evaluator.local_evaluator \
+export OLLAMA_ENABLED=0
+```
+
+With the separately supplied organizer development package, the one-command
+public reproduction run is:
+
+```bash
+python -m evaluator.local_evaluator \
   --catalog data/catalog.jsonl \
   --dataset data/public_set.jsonl \
   --output results.json
 ```
 
-The official harness can use its private dataset in place of
-`data/public_set.jsonl`. It should import `Agent` from `submission.agent`, call
-`reset` once per session, and then call `respond` for each turn.
+The official harness should import `Agent` from `submission.agent`, pass the
+organizer catalog path to the constructor, call `reset` once per session, and
+then call `respond` for each turn. For local development only, teams may use
+the evaluator and public sessions from the organizer's separate development
+package.
 
 ## Method and model choice
 
@@ -79,7 +110,7 @@ BM25 first creates a bounded candidate set; semantic scoring never searches the
 full catalog. A prebuilt semantic index can be generated during setup with:
 
 ```bash
-python -m submission.precompute --build-embeddings
+python -m submission.src.precompute --build-embeddings
 ```
 
 The generated `data/semantic_index.sqlite` is about 447 MB in the current
@@ -123,6 +154,20 @@ reference, not a claim about cold-start or Ollama latency on organizer
 hardware; a bundle that excludes generated caches will be slower on its first
 run.
 
+## Team contributions
+
+Based on the contribution history represented in this development branch:
+
+- **Elbert:** catalog preprocessing and embedding infrastructure, BM25 and
+  semantic retrieval, conversational recommendation state and intent-override
+  behavior, tuning, integration, and submission documentation/packaging.
+- **KelvenN11:** entropy-based clarification design and implementation,
+  information-gain formula refinements, and simplification of answerability
+  weighting.
+
+Any non-code contributions not represented in Git history should be added to
+this section before the final submission.
+
 ## Environment variables
 
 All variables are optional. Defaults reproduce the checked-in configuration.
@@ -142,8 +187,8 @@ All variables are optional. Defaults reproduce the checked-in configuration.
 | `SEMANTIC_EXPANSION_WEIGHT` | `0.20` | Contribution from model-selected concept expansions. |
 | `BM25_WEIGHTS` | `0,4.5,4,2.5,2.5,1.5,1` | Seven non-negative FTS column weights. |
 | `CATALOG_FTS_PATH` | beside catalog | Generated FTS cache location. |
-| `CATALOG_ATTRIBUTES_PATH` | `data/catalog_attributes.jsonl` | Structured attribute catalog. |
-| `CLEAN_CATALOG_PATH` | `data/catalog_attributes.jsonl` | Dynamic semantic-concept catalog. |
+| `CATALOG_ATTRIBUTES_PATH` | `submission/assets/catalog_attributes.jsonl` | Structured attribute catalog. |
+| `CLEAN_CATALOG_PATH` | `submission/assets/catalog_attributes.jsonl` | Dynamic semantic-concept catalog. |
 | `SEMANTIC_INDEX_PATH` | beside clean catalog | Optional persisted semantic index. |
 
 ## Known limitations

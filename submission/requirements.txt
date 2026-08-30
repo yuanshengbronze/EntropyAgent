@@ -1,0 +1,2 @@
+# No third-party Python packages are required.
+# Runtime: CPython 3.10+ with SQLite FTS5 support.

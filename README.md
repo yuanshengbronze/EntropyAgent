@@ -66,36 +66,65 @@ The response loop is deliberately lightweight:
 
 - Python 3.10 or newer
 - A standard Python build with SQLite FTS5 support
-- `data/catalog.jsonl` containing the 50,000-product frozen catalog
-- `data/catalog_attributes.jsonl`, generated deterministically from the frozen catalog
 - No third-party Python packages
 
-Download `catalog.jsonl.gz` from the repository's challenge release, verify it against the published `SHA256SUMS`, and extract it to `data/catalog.jsonl`.
+The submission repository intentionally does not include `data/`, `evaluator/`,
+`tests/`, or `docs/`. Those directories contain organizer-provided development
+artifacts rather than participant runtime source. During official evaluation,
+the organizer must make the frozen 50,000-product catalog available to the
+agent and pass its path to `Agent(...)`.
 
-Generate the structured attribute catalog with no LLM or network calls:
+For local development, place the organizer-provided catalog at
+`data/catalog.jsonl`. The public sessions and local evaluator are optional
+development tools distributed by the organizer; they are not needed by the
+agent at runtime and are not part of this repository.
+
+The submission includes `submission/assets/catalog_attributes.jsonl`, a
+deterministically derived representation of the frozen catalog. To reproduce or
+refresh it from the organizer-provided raw catalog without an LLM or network
+service, run:
 
 ```bash
-python -m submission.extract_product_attributes \
+python -m submission.src.extract_product_attributes \
   --input data/catalog.jsonl \
-  --output data/catalog_attributes.jsonl
+  --output submission/assets/catalog_attributes.jsonl
 ```
 
+This bundled asset enables adaptive questions, answer grounding, constraint and
+rating reranking, and catalog-grounded semantic concepts. It contains product
+metadata derived from the public frozen catalog—not public-session labels,
+private evaluation data, user data, or credentials.
+
 ### Run the deterministic offline agent
+
+The official harness imports `Agent` directly. To force the network-free,
+deterministic path, set `OLLAMA_ENABLED=0` in the evaluation environment before
+starting that harness.
 
 PowerShell:
 
 ```powershell
 $env:OLLAMA_ENABLED = "0"
-python -m evaluator.local_evaluator --output results.json
 ```
 
 Bash:
 
 ```bash
-OLLAMA_ENABLED=0 python -m evaluator.local_evaluator --output results.json
+export OLLAMA_ENABLED=0
 ```
 
-The evaluator simulates all 200 public sessions and writes aggregate, per-scenario, and per-session metrics to `results.json`.
+If you have the organizer's development package locally, the reproducible
+public-harness command is:
+
+```bash
+python -m evaluator.local_evaluator \
+  --catalog data/catalog.jsonl \
+  --dataset data/public_set.jsonl \
+  --output results.json
+```
+
+The evaluator, raw catalog, and public labels are supplied separately by the
+organizer and are deliberately not duplicated here.
 
 ### Catalog attributes and embeddings
 
@@ -137,22 +166,22 @@ The optional semantic path uses Ollama on `http://localhost:11434` by default:
 ```bash
 ollama pull llama3.2:3b
 ollama pull nomic-embed-text-v2-moe
-python -m evaluator.local_evaluator --output results.json
 ```
+
+Then start the organizer's harness with `OLLAMA_ENABLED=1` (the default).
 
 For faster repeated runs, build the persistent concept-vector index once:
 
 ```bash
-python -m submission.precompute --build-embeddings
+python -m submission.src.precompute --build-embeddings
 ```
 
 This creates `data/semantic_index.sqlite`. The agent also creates a catalog-fingerprinted `data/catalog_fts.sqlite` cache on first use. Both caches are generated artifacts and are automatically bypassed when incompatible with their source data or model.
 
-### Run tests and the conversational smoke check
+### Run the conversational smoke check
 
-```bash
-python -m unittest discover -s tests
-```
+The repository includes a catalog-only smoke check that does not use the
+public development sessions or evaluator:
 
 ```bash
 OLLAMA_ENABLED=0 python smoke_check.py
@@ -212,28 +241,45 @@ All settings are optional environment variables.
 | `OVERRIDE_CANDIDATES` | `150` | Candidate-pool size after an intent override. |
 | `BM25_WEIGHTS` | `0,4.5,4,2.5,2.5,1.5,1` | FTS5 weights for ID and six searchable fields. |
 | `CATALOG_FTS_PATH` | beside catalog | Optional generated FTS cache path. |
-| `CATALOG_ATTRIBUTES_PATH` | `data/catalog_attributes.jsonl` | Structured attributes used for questions and constraints. |
+| `CATALOG_ATTRIBUTES_PATH` | `submission/assets/catalog_attributes.jsonl` | Structured attributes used for questions and constraints. |
 | `SEMANTIC_INDEX_PATH` | `data/semantic_index.sqlite` | Optional persisted concept-vector index. |
 
 ## Repository Layout
 
+The official upload unit is the self-contained `submission/` directory. Files
+at the repository root document or exercise the project but are not required by
+the evaluation runtime.
+
 ```text
+README.md                     project overview and setup instructions
+SUBMISSION.md                 method, reproducibility, cost, and limitations report
+DATA_ATTRIBUTION.md           source-data attribution
+ENTROPY_QUESTION_SELECTION.md question-selection design notes
+smoke_check.py                catalog-only conversational smoke check
 submission/
-  agent.py                    required Agent implementation
-  extract_product_attributes.py deterministic structured-attribute extractor
-  question_selection.py       entropy and answer-grounding logic
-  semantic_index.py           concept and index utilities
-  precompute.py               optional catalog/index preprocessing
-evaluator/
-  local_evaluator.py          official-style public simulator and scorer
-  dev_evaluator.py            development evaluation utilities
-tests/                        evaluator and question-selection tests
-data/
-  catalog.jsonl               frozen 50,000-product catalog (downloaded)
-  catalog_attributes.jsonl    derived structured product attributes
-  public_set.jsonl            200 labeled development sessions
-docs/                         rules, API contract, and scoring specification
+  agent.py                    required Agent entry point
+  README.md                   submission setup and harness instructions
+  requirements.txt            Python dependency manifest (standard library only)
+  assets/
+    catalog_attributes.jsonl  bundled catalog-derived runtime attributes
+  src/
+    __init__.py
+    extract_product_attributes.py deterministic attribute extractor
+    question_selection.py     entropy and answer-grounding logic
+    semantic_index.py         concept and index utilities
+    precompute.py             optional catalog/index preprocessing
 ```
+
+Not included in the submission repository:
+
+- `data/`: organizer raw catalog/public sessions and locally generated indexes
+- `evaluator/`: organizer development harness
+- `tests/`: organizer/development tests
+- `docs/`: organizer rules, API contract, and competition specification
+
+This matches the published submission rules: teams submit their agent source,
+helper modules, setup instructions, and report, while organizer-owned files and
+evaluation data are not copied into the participant bundle.
 
 ## Limitations
 
@@ -245,7 +291,7 @@ docs/                         rules, API contract, and scoring specification
 
 ## Data and Responsible Use
 
-The catalog and sessions are derived from **Amazon Reviews 2023** by McAuley Lab, UCSD. The agent receives only an anonymized aggregate preference profile—no raw user identifiers, review text, timestamps, or purchase history. See [`DATA_ATTRIBUTION.md`](DATA_ATTRIBUTION.md) for source and redistribution details, and [`docs/competition_specification.md`](docs/competition_specification.md) for the complete challenge protocol.
+The catalog and sessions are derived from **Amazon Reviews 2023** by McAuley Lab, UCSD. The agent receives only an anonymized aggregate preference profile—no raw user identifiers, review text, timestamps, or purchase history. See [`DATA_ATTRIBUTION.md`](DATA_ATTRIBUTION.md) for source and redistribution details. The complete challenge protocol and API contract are supplied separately by the organizer and are intentionally not copied into this repository.
 
 ---
 

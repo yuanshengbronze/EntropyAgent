@@ -608,7 +608,11 @@ def process(input_path: Path, output_path: Path, limit: int | None = None) -> in
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=Path("data/catalog.jsonl"))
-    parser.add_argument("--output", type=Path, default=Path("data/catalog_attributes.jsonl"))
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("submission/assets/catalog_attributes.jsonl"),
+    )
     parser.add_argument("--limit", type=int, help="Process only the first N records (for validation).")
     args = parser.parse_args()
     count = process(args.input, args.output, args.limit)

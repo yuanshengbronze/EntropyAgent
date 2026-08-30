@@ -14,14 +14,24 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from submission.question_selection import (
-    ASKABLE_ATTRIBUTES,
-    choose_next_question,
-    gain_ratio_multilabel_missing,
-    ground_answer,
-    normalize_attributes,
-)
-from submission.semantic_index import concepts_for_item, file_sha256
+if __package__:
+    from .src.question_selection import (
+        ASKABLE_ATTRIBUTES,
+        choose_next_question,
+        gain_ratio_multilabel_missing,
+        ground_answer,
+        normalize_attributes,
+    )
+    from .src.semantic_index import concepts_for_item, file_sha256
+else:  # Supports harnesses that place submission/ on sys.path and import agent.
+    from src.question_selection import (
+        ASKABLE_ATTRIBUTES,
+        choose_next_question,
+        gain_ratio_multilabel_missing,
+        ground_answer,
+        normalize_attributes,
+    )
+    from src.semantic_index import concepts_for_item, file_sha256
 
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
@@ -342,12 +352,17 @@ class Agent:
         if configured:
             clean_path = Path(configured)
         else:
-            clean_path = self.catalog_path.with_name("catalog_attributes.jsonl")
+            bundled_path = Path(__file__).with_name("assets") / "catalog_attributes.jsonl"
+            clean_path = (
+                bundled_path
+                if bundled_path.exists()
+                else self.catalog_path.with_name("catalog_attributes.jsonl")
+            )
             if not clean_path.exists():
                 # Lazily create the flat semantic catalog on first use.  This
                 # keeps normal runs fast while allowing a raw catalog to work
                 # without a separate manual preprocessing command.
-                precompute = Path(__file__).with_name("precompute.py")
+                precompute = Path(__file__).with_name("src") / "precompute.py"
                 if precompute.exists():
                     try:
                         subprocess.run(
@@ -439,11 +454,15 @@ class Agent:
     def _load_attribute_index(self) -> None:
         """Load question attributes and rating metadata from the flat catalog."""
         configured = os.environ.get("CATALOG_ATTRIBUTES_PATH")
-        path = (
-            Path(configured)
-            if configured
-            else self.catalog_path.with_name("catalog_attributes.jsonl")
-        )
+        if configured:
+            path = Path(configured)
+        else:
+            bundled_path = Path(__file__).with_name("assets") / "catalog_attributes.jsonl"
+            path = (
+                bundled_path
+                if bundled_path.exists()
+                else self.catalog_path.with_name("catalog_attributes.jsonl")
+            )
         if not path.exists():
             return
         for row in _jsonl(path):
