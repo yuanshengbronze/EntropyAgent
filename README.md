@@ -38,8 +38,8 @@ flowchart LR
     C --> H[Constraint and rating reranker]
     C --> E[Optional local semantic reranker]
     E --> G{Confident signal?}
-    G -- Yes --> H
-    G -- No --> H
+    G -- yes, blend --> H
+    G -- no, discard --> H
     H --> O[Top 10 recommendations]
     C --> Q[Information-gain question selector]
     Q --> A[Next clarification]
@@ -158,14 +158,18 @@ Keeping `catalog_attributes.jsonl` is deliberate: even if semantic embeddings ca
 
 ### Enable local semantic reranking
 
-The optional semantic path uses Ollama on `http://localhost:11434` when enabled:
+Install Ollama from [ollama.com/download](https://ollama.com/download), or on
+Linux with `curl -fsSL https://ollama.com/install.sh | sh`, and ensure the
+service is running (`ollama serve`; the desktop app starts it automatically).
+Then pull the two local models:
 
 ```bash
 ollama pull llama3.2:3b
 ollama pull nomic-embed-text-v2-moe
 ```
 
-Then start the organizer's harness with `OLLAMA_ENABLED=1` to opt in.
+The optional semantic path talks to Ollama on `http://localhost:11434`. Start
+the organizer's harness with `OLLAMA_ENABLED=1` to opt in.
 
 For faster repeated runs, build the persistent concept-vector index once:
 
@@ -180,15 +184,20 @@ incompatible with their source data or model.
 
 ## Agent Contract
 
-The official harness imports `Agent` from `submission.agent`:
+The agent entry point is `submission/agent.py`. Because it is packaged under
+`submission/`, the evaluation harness imports it as `submission.agent`, not as
+the starter kit's top-level `agent` module:
 
 ```python
 from submission.agent import Agent
 
-agent = Agent("data/catalog.jsonl")
+agent = Agent("data/catalog.jsonl")          # organizer-provided catalog path
 agent.reset(session_id, user_profile)
 response = agent.respond(session_id, user_message, turn, top_k=10)
 ```
+
+Harnesses that place `submission/` on `sys.path` may use `from agent import Agent`
+instead; both import forms are supported.
 
 Each response follows the competition contract:
 
@@ -218,23 +227,28 @@ Technical Score = 0.50 × Hit Rate@10 + 0.30 × MRR + 0.20 × Efficiency
 
 ## Configuration
 
-All settings are optional environment variables.
+All settings are optional environment variables; the defaults reproduce the
+checked-in configuration.
 
-| Variable                   | Default                                      | Purpose                                                                                                      |
-| -------------------------- | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `OLLAMA_ENABLED`           | `0`                                          | Set to `1` to opt into local Ollama; otherwise use immediate deterministic offline mode.                     |
-| `OLLAMA_URL`               | `http://localhost:11434`                     | Local Ollama base URL.                                                                                       |
-| `OLLAMA_MODEL`             | `llama3.2:3b`                                | Catalog-constrained concept-selection model.                                                                 |
-| `OLLAMA_EMBED_MODEL`       | `nomic-embed-text-v2-moe`                    | Local embedding model.                                                                                       |
-| `OLLAMA_TIMEOUT`           | `30`                                         | Per-request timeout in seconds.                                                                              |
-| `SEMANTIC_RERANK_ENABLED`  | `1`                                          | Enable or disable semantic reranking.                                                                        |
-| `ANSWER_GROUNDING_ENABLED` | `1`                                          | Set to `0`, `false`, or `no` to skip clarification-answer grounding; answers remain ordinary query evidence. |
-| `SEMANTIC_CANDIDATES`      | `50`                                         | Normal BM25 candidate-pool size.                                                                             |
-| `OVERRIDE_CANDIDATES`      | `150`                                        | Candidate-pool size after an intent override.                                                                |
-| `BM25_WEIGHTS`             | `0,4.5,4,2.5,2.5,1.5,1`                      | FTS5 weights for ID and six searchable fields.                                                               |
-| `CATALOG_FTS_PATH`         | beside catalog                               | Optional generated FTS cache path.                                                                           |
-| `CATALOG_ATTRIBUTES_PATH`  | `submission/assets/catalog_attributes.jsonl` | Structured attributes used for questions and constraints.                                                    |
-| `SEMANTIC_INDEX_PATH`      | `submission/assets/semantic_index.sqlite`    | Optional persisted concept-vector index.                                                                     |
+<!-- Keep this table in sync with SUBMISSION.md § Environment variables. -->
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `OLLAMA_ENABLED` | `0` | Set to `1` to opt into local Ollama; `0`, `false`, `no`, or unset selects the deterministic offline path. |
+| `OLLAMA_URL` | `http://localhost:11434` | Local Ollama base URL. |
+| `OLLAMA_MODEL` | `llama3.2:3b` | Catalog-constrained concept-selection model. |
+| `OLLAMA_EMBED_MODEL` | `nomic-embed-text-v2-moe` | Local embedding model and semantic-index identity. |
+| `OLLAMA_TIMEOUT` | `30` | Per-request timeout in seconds for the agent. The `extract_product_attributes` build script uses `120` when the variable is unset. |
+| `SEMANTIC_CANDIDATES` | `50` | Normal BM25 candidate-pool size. |
+| `OVERRIDE_CANDIDATES` | `150` | Candidate-pool size after an intent override. |
+| `SEMANTIC_CONFIDENCE_MARGIN` | `0.015` | Minimum top-vs-runner-up semantic-score separation before a rerank is trusted. |
+| `SEMANTIC_BLEND_WEIGHT` | `0.85` | Semantic contribution to a confident rerank. |
+| `SEMANTIC_EXPANSION_WEIGHT` | `0.20` | Contribution from model-selected concept expansions; `0` disables the LLM expansion call. |
+| `BM25_WEIGHTS` | `0,4.5,4,2.5,2.5,1.5,1` | Seven non-negative FTS5 column weights: `parent_asin` (unindexed), title, categories, features, details, store, description. |
+| `CATALOG_FTS_PATH` | beside catalog | Optional generated FTS cache path. |
+| `CATALOG_ATTRIBUTES_PATH` | `submission/assets/catalog_attributes.jsonl` | Structured attributes used for questions, constraints, and ratings. |
+| `CLEAN_CATALOG_PATH` | `submission/assets/catalog_attributes.jsonl` | Concept source for semantic retrieval (the same bundled file by default). |
+| `SEMANTIC_INDEX_PATH` | `submission/assets/semantic_index.sqlite` | Optional persisted concept-vector index (resolved beside `CLEAN_CATALOG_PATH`). |
 
 ## Repository Layout
 
@@ -247,9 +261,10 @@ README.md                     project overview and setup instructions
 SUBMISSION.md                 method, reproducibility, cost, and limitations report
 DATA_ATTRIBUTION.md           source-data attribution
 ENTROPY_QUESTION_SELECTION.md question-selection design notes
-smoke_check.py                catalog-only conversational smoke check
 submission/
+  __init__.py
   agent.py                    required Agent entry point
+  demo.py                     offline multi-turn demonstration script
   README.md                   submission setup and harness instructions
   requirements.txt            Python dependency manifest (standard library only)
   assets/

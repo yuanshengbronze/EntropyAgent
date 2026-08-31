@@ -11,6 +11,7 @@ Upload the `submission/` directory with these participant-owned runtime files:
 ```text
 submission/__init__.py
 submission/agent.py
+submission/demo.py
 submission/README.md
 submission/requirements.txt
 submission/assets/catalog_attributes.jsonl
@@ -36,7 +37,7 @@ organizer documentation. In particular, exclude:
 ```text
 data/public_set.jsonl
 data/catalog_fts.sqlite
-data/semantic_index.sqlite
+submission/assets/semantic_index.sqlite
 evaluator/
 tests/
 docs/
@@ -110,11 +111,11 @@ BM25 first creates a bounded candidate set; semantic scoring never searches the
 full catalog. A prebuilt semantic index can be generated during setup with:
 
 ```bash
-python -m submission.src.precompute --build-embeddings
+python -m submission.src.precompute
 ```
 
-The generated `data/semantic_index.sqlite` is about 447 MB in the current
-development environment and is deliberately excluded from the normal
+The generated `submission/assets/semantic_index.sqlite` is about 447 MB in the
+current development environment and is deliberately excluded from the normal
 submission bundle unless the organizer explicitly permits an artifact of that
 size.
 
@@ -135,8 +136,9 @@ waiting for a failed local-model request in a network-restricted environment.
 Measurements below were taken on the current Windows development machine on
 2026-08-30 with warm generated retrieval caches:
 
-- Offline smoke benchmark (`OLLAMA_ENABLED=0`): agent initialization plus four
-  conversational turns completed in 3.107 seconds wall-clock.
+- Offline demonstration (`python -m submission.demo`, `OLLAMA_ENABLED=0`): agent
+  initialization plus four conversational turns completed in 3.107 seconds
+  wall-clock.
 - The recorded 200-session development run in `results.dev.json` reported
   18,292 prompt tokens and 2,313 completion tokens, or 20,605 total generation
   tokens (103.025 per session on average).
@@ -170,26 +172,27 @@ this section before the final submission.
 
 ## Environment variables
 
-All variables are optional. Defaults reproduce the checked-in configuration.
+All variables are optional; the defaults reproduce the checked-in configuration.
+
+<!-- Keep this table in sync with README.md § Configuration. -->
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `OLLAMA_ENABLED` | `1` | Set to `0`, `false`, or `no` for immediate offline fallback. |
-| `OLLAMA_URL` | `http://localhost:11434` | Base URL of the local Ollama server. |
-| `OLLAMA_MODEL` | `llama3.2:3b` | Local concept-selection model. |
+| `OLLAMA_ENABLED` | `0` | Set to `1` to opt into local Ollama; `0`, `false`, `no`, or unset selects the deterministic offline path. |
+| `OLLAMA_URL` | `http://localhost:11434` | Local Ollama base URL. |
+| `OLLAMA_MODEL` | `llama3.2:3b` | Catalog-constrained concept-selection model. |
 | `OLLAMA_EMBED_MODEL` | `nomic-embed-text-v2-moe` | Local embedding model and semantic-index identity. |
-| `OLLAMA_TIMEOUT` | `30` | Per-request timeout in seconds. |
-| `SEMANTIC_RERANK_ENABLED` | `1` | Enables semantic reranking when embeddings are available. |
-| `SEMANTIC_CANDIDATES` | `50` | Standard lexical candidate limit. |
-| `OVERRIDE_CANDIDATES` | `150` | Candidate limit immediately after an intent override. |
-| `SEMANTIC_CONFIDENCE_MARGIN` | `0.015` | Minimum top semantic-score separation. |
+| `OLLAMA_TIMEOUT` | `30` | Per-request timeout in seconds for the agent. The `extract_product_attributes` build script uses `120` when the variable is unset. |
+| `SEMANTIC_CANDIDATES` | `50` | Normal BM25 candidate-pool size. |
+| `OVERRIDE_CANDIDATES` | `150` | Candidate-pool size after an intent override. |
+| `SEMANTIC_CONFIDENCE_MARGIN` | `0.015` | Minimum top-vs-runner-up semantic-score separation before a rerank is trusted. |
 | `SEMANTIC_BLEND_WEIGHT` | `0.85` | Semantic contribution to a confident rerank. |
-| `SEMANTIC_EXPANSION_WEIGHT` | `0.20` | Contribution from model-selected concept expansions. |
-| `BM25_WEIGHTS` | `0,4.5,4,2.5,2.5,1.5,1` | Seven non-negative FTS column weights. |
-| `CATALOG_FTS_PATH` | beside catalog | Generated FTS cache location. |
-| `CATALOG_ATTRIBUTES_PATH` | `submission/assets/catalog_attributes.jsonl` | Structured attribute catalog. |
-| `CLEAN_CATALOG_PATH` | `submission/assets/catalog_attributes.jsonl` | Dynamic semantic-concept catalog. |
-| `SEMANTIC_INDEX_PATH` | beside clean catalog | Optional persisted semantic index. |
+| `SEMANTIC_EXPANSION_WEIGHT` | `0.20` | Contribution from model-selected concept expansions; `0` disables the LLM expansion call. |
+| `BM25_WEIGHTS` | `0,4.5,4,2.5,2.5,1.5,1` | Seven non-negative FTS5 column weights: `parent_asin` (unindexed), title, categories, features, details, store, description. |
+| `CATALOG_FTS_PATH` | beside catalog | Optional generated FTS cache path. |
+| `CATALOG_ATTRIBUTES_PATH` | `submission/assets/catalog_attributes.jsonl` | Structured attributes used for questions, constraints, and ratings. |
+| `CLEAN_CATALOG_PATH` | `submission/assets/catalog_attributes.jsonl` | Concept source for semantic retrieval (the same bundled file by default). |
+| `SEMANTIC_INDEX_PATH` | `submission/assets/semantic_index.sqlite` | Optional persisted concept-vector index (resolved beside `CLEAN_CATALOG_PATH`). |
 
 ## Known limitations
 

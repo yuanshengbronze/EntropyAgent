@@ -4,7 +4,7 @@ Structured attributes are built by :mod:`extract_product_attributes`; this
 module only embeds those already-normalized concepts.
 
 Example:
-    python -m submission.src.precompute --build-embeddings
+    python -m submission.src.precompute
 """
 
 from __future__ import annotations
@@ -139,9 +139,6 @@ def main() -> None:
         "--ollama-url", default=os.environ.get("OLLAMA_URL", "http://localhost:11434"),
         help="Ollama base URL.",
     )
-    # Retain the old explicit spelling while the command itself now has one
-    # purpose: building embeddings from an existing attribute catalog.
-    parser.add_argument("--build-embeddings", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--embedding-input",
         default="submission/assets/catalog_attributes.jsonl",

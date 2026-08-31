@@ -4,6 +4,8 @@ __pycache__/
 .env
 results*.json
 data/
+# Generated semantic index (large, catalog-derived; rebuilt via precompute).
+submission/assets/semantic_index.sqlite
 docs/
 evaluator/
 tests/

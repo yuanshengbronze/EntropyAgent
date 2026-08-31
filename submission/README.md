@@ -8,7 +8,9 @@ competition contract.
 
 ```text
 submission/
+  __init__.py
   agent.py
+  demo.py
   requirements.txt
   README.md
   assets/
@@ -114,8 +116,10 @@ API, so estimated external model cost is USD 0.00.
 
 ## Demonstrated multi-turn session
 
-The catalog-only `smoke_check.py` produced the following abbreviated offline
-session with `OLLAMA_ENABLED=0`:
+`python -m submission.demo` replays a short offline conversation through the
+agent with `OLLAMA_ENABLED=0`. It reads the organizer catalog at
+`data/catalog.jsonl` (override with `--catalog PATH`) and reports zero model
+tokens. An abbreviated run:
 
 ```text
 User:  I need a men's rain jacket. A key requirement is: waterproof.

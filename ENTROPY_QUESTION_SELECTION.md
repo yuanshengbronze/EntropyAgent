@@ -160,9 +160,10 @@ maximally "informative" even though asking about it barely narrows
 anything (each value only matches ~1 item). This is exactly why C4.5
 exists as a correction to ID3.
 
-**Fix — Gain Ratio** (Quinlan, *C4.5: Programs for Machine Learning*, 1993
-— formulas summarized at https://arxiv.org/pdf/2603.11117, Appendix B,
-Eq. B.6–B.7):
+**Fix — Gain Ratio** (Quinlan, *C4.5: Programs for Machine Learning*, 1993;
+Gain Ratio and Split Information restated as Eq. B.6–B.7 in Marton,
+*Learning Tree-Based Models with Gradient Descent*, PhD thesis, 2026 —
+https://arxiv.org/pdf/2603.11117):
 
 ```
 SplitInfo(A)  = -Σᵥ (|Sᵥ|/|S|) · log₂(|Sᵥ|/|S|)
@@ -294,6 +295,16 @@ Notes:
 - Reference implementation: `submission/src/question_selection.py`
   (`gain_ratio_multilabel_missing`, `choose_next_question`).
 
+### Integration note — the packaged agent
+
+`submission/agent.py` (`_entropy_attribute`) uses this coverage-discounted gain
+ratio as one term of a wider per-turn utility: it also weights each candidate by
+its current rank, so the question it picks is one likely to move a *highly
+ranked* recommendation rather than any candidate in the pool. When no structured
+attribute has positive value-of-information it defers to `choose_next_question`
+(wildcard `"other"`, then silence). The function in this document is the core
+signal; the wrapper only adds ranking-awareness.
+
 ---
 
 ## 5. Continuous attributes (budget)
@@ -336,5 +347,5 @@ def bucket_budget(top_k, n_buckets=4):
 | Paper | Link | Contribution |
 |---|---|---|
 | Quinlan, *Induction of Decision Trees*, 1986 | https://link.springer.com/article/10.1007/BF00116251 | Base entropy / information gain formula |
-| Quinlan, *C4.5: Programs for Machine Learning*, 1993 | https://arxiv.org/pdf/2603.11117 (formulas summarized, Appendix B) | Gain Ratio (cardinality correction), missing-value handling |
+| Quinlan, *C4.5: Programs for Machine Learning*, 1993 (Morgan Kaufmann) | Gain Ratio / Split Information restated as Eq. B.6–B.7 in [Marton, *Learning Tree-Based Models with Gradient Descent*, PhD thesis, 2026](https://arxiv.org/pdf/2603.11117) | Gain Ratio (cardinality correction), missing-value handling |
 | Clare & King, *Knowledge Discovery in Multi-label Phenotype Data*, PKDD 2001 | https://www.semanticscholar.org/paper/Knowledge-Discovery-in-Multi-label-Phenotype-Data-Clare-King/e64ef24d0f6a9cefd7bf7a6b1d5f34f90ec37939 | Multi-label entropy (item has multiple attribute values) |
