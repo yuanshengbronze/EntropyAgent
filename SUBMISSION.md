@@ -139,9 +139,8 @@ Measurements below were taken on the current Windows development machine on
 - Offline demonstration (`python -m submission.demo`, `OLLAMA_ENABLED=0`): agent
   initialization plus a full simulated clarification dialogue completed in
   roughly 3 seconds wall-clock.
-- The recorded 200-session development run in `results.dev.json` reported
-  18,292 prompt tokens and 2,313 completion tokens, or 20,605 total generation
-  tokens (103.025 per session on average).
+- The 200-session development run with local Ollama enabled used 125,778 tokens
+  in total, about 629 per session (the LLM-Enabled row in `README.md`).
 - Offline fallback reports zero model tokens. `precompute.py` reports embedding
   token usage when the local Ollama response includes `prompt_eval_count`.
 - Estimated external model/API cost is USD 0.00 for the intended local Ollama
