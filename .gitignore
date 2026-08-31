@@ -6,6 +6,8 @@ results*.json
 data/
 # Generated semantic index (large, catalog-derived; rebuilt via precompute).
 submission/assets/semantic_index.sqlite
+# Generated FTS cache (catalog-derived; rebuilt automatically by the agent).
+submission/assets/catalog_fts.sqlite
 docs/
 evaluator/
 tests/
