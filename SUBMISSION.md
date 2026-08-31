@@ -158,17 +158,33 @@ run.
 
 ## Team contributions
 
-Based on the contribution history represented in this development branch:
+Two members owned implementation; three owned the research and methodology
+behind the solution. Members collaborated across areas; the split below reflects
+primary ownership, and the research contributions are not reflected in Git
+commit history.
 
-- **Elbert:** catalog preprocessing and embedding infrastructure, BM25 and
-  semantic retrieval, conversational recommendation state and intent-override
-  behavior, tuning, integration, and submission documentation/packaging.
-- **KelvenN11:** entropy-based clarification design and implementation,
-  information-gain formula refinements, and simplification of answerability
-  weighting.
-
-Any non-code contributions not represented in Git history should be added to
-this section before the final submission.
+- **Elbert Tristan Lie — Retrieval & pipeline implementation.** Built the
+  dual-track intent routing, the weighted FTS5 BM25 index and multi-route
+  retrieval, the deterministic/Ollama attribute extractor, and the
+  BM25 → semantic-rerank in-memory pipeline.
+- **Kelven Nathanael — Dialogue & question-selection implementation.** Built the
+  conversational state tracker (incremental slot accumulation and
+  intent-override rewriting) and the entropy / gain-ratio question selector with
+  its `ENTROPY_QUESTION_SELECTION.md` specification.
+- **Alexandra Martina Setiawan — Retrieval research.** Surveyed hybrid
+  lexical-plus-dense retrieval, field-weighted BM25, pseudo-relevance feedback,
+  and candidate-constrained LLM reranking; benchmarked local embedding models.
+- **Frederico Samuel Halim — Conversational-strategy research.** Reviewed
+  mixed-initiative conversational search, dialogue state tracking and
+  slot-filling, information-gain clarification, and intent-override recovery;
+  sourced the ID3 / C4.5 gain-ratio and multi-label-entropy literature and the
+  personalized context-distillation framing the implementation follows.
+- **Aufan Ahmad Mumtaza — Evaluation methodology.** Studied the organizer's
+  scoring criteria (Hit Rate@K, MRR, MTTC, and the Efficiency reward) to
+  translate them into concrete design targets, analyzed the Amazon Reviews 2023
+  catalog for coverage and attribute sparsity, and built the offline evaluation
+  loop and per-turn diagnostics the team used to track those metrics during
+  development.
 
 ## Environment variables
 

@@ -165,11 +165,28 @@ Agent: I found some close matches. Any preference on style?
 
 ## Team contributions
 
-The development-branch history records Elbert's work on catalog preprocessing,
-hybrid retrieval, conversational state, tuning, integration, and submission
-packaging, and KelvenN11's work on entropy-based clarification and its scoring
-refinements. Add any non-code contributions not represented in Git history
-before the final submission.
+Two members owned implementation and three owned the research behind the
+solution; the research contributions are not reflected in Git commit history.
+
+- **Elbert Tristan Lie — Retrieval & pipeline implementation.** Dual-track intent
+  routing, the weighted FTS5 BM25 index and multi-route retrieval, the
+  deterministic/Ollama attribute extractor, and the BM25 → semantic-rerank
+  in-memory pipeline.
+- **Kelven Nathanael — Dialogue & question-selection implementation.** The
+  conversational state tracker (incremental slot accumulation and
+  intent-override rewriting) and the entropy / gain-ratio question selector with
+  its `ENTROPY_QUESTION_SELECTION.md` specification.
+- **Alexandra Martina Setiawan — Retrieval research.** Hybrid lexical-plus-dense
+  retrieval, field-weighted BM25, pseudo-relevance feedback, and
+  candidate-constrained LLM reranking; local embedding-model benchmarking.
+- **Frederico Samuel Halim — Conversational-strategy research.** Mixed-initiative
+  conversational search, dialogue state tracking and slot-filling,
+  information-gain clarification, and intent-override recovery; the ID3 / C4.5
+  gain-ratio and multi-label-entropy literature.
+- **Aufan Ahmad Mumtaza — Evaluation methodology.** Interpreting the organizer's
+  scoring criteria (Hit Rate@K, MRR, MTTC) as design targets, Amazon Reviews
+  2023 catalog analysis, and the offline evaluation loop and per-turn
+  diagnostics used to track progress.
 
 ## Rebuilding the bundled attribute asset
 
