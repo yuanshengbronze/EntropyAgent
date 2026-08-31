@@ -8,7 +8,7 @@ The system combines fast lexical retrieval, catalog-grounded semantic reranking,
 
 ## Results at a Glance
 
-Results below are from the 200-session public development set. The Ollama-off run
+Results below are from the 200-session public development set. The LLM Disabled run
 is the default configuration.
 
 | System                                      | Hit Rate@10 |          MRR |    MTTC ↓ | Efficiency | Technical Score |
@@ -17,7 +17,7 @@ is the default configuration.
 | **Our conversational agent - LLM Disabled** |   **98.5%** | **0.523732** | **3.455** | **0.7545** |     **0.80052** |
 | **Our conversational agent - LLM Enabled**  |   **98.5%** | **0.521768** | **3.455** | **0.7545** |     **0.79993** |
 
-With LLM Disabled, the run used 0 tokens. With LLM Enabled, the run used 125778 tokens across 200 sessions and incurred **$0 in external API cost**.
+With LLM Disabled, the run used 0 tokens. With LLM Enabled, the run used 125778 tokens across 200 sessions and incurred **$0 in external API cost**. While enabling the LLM results in similar performance for this specific case, for cases where user queries are more vague it might increase the system's accuracy.
 
 ## Why It Stands Out
 
