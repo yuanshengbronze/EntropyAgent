@@ -98,11 +98,6 @@ With a local Ollama service and `OLLAMA_ENABLED=1`, the agent uses
 API key or internet service is used during evaluation. If Ollama is unavailable
 or disabled, the agent falls back automatically to its deterministic path.
 
-Clarification-answer grounding is independently configurable. Set
-`ANSWER_GROUNDING_ENABLED=0` before constructing `Agent` to skip both embedding
-matching and token-overlap matching of an answer to structured attribute
-values. The answer still contributes ordinary conversational query terms.
-
 ## Method, model, and cost summary
 
 The agent retrieves a bounded candidate pool with field-weighted SQLite FTS5
@@ -115,9 +110,7 @@ semantic scores are used only when their confidence margin is sufficient.
 
 The default optional local models are `llama3.2:3b` and
 `nomic-embed-text-v2-moe`. The intended configuration uses no billable external
-API, so estimated external model cost is USD 0.00. The recorded 200-session
-development run used 18,292 generation-prompt tokens and 2,313 completion
-tokens.
+API, so estimated external model cost is USD 0.00.
 
 ## Demonstrated multi-turn session
 
@@ -169,7 +162,16 @@ python -m submission.src.extract_product_attributes \
 
 The extractor uses a local Ollama model when `OLLAMA_ENABLED=1` and falls back
 to its deterministic parser when disabled or unavailable. Ollama is disabled
-by default.
+by default. The default output location is `submission/assets`.
+
+To build the optional semantic SQLite index, use:
+
+```bash
+python -m submission.src.precompute
+```
+
+This writes `submission/assets/semantic_index.sqlite` by default. Both scripts
+accept explicit input/output paths when a different location is required.
 
 The full architecture and evaluation breakdown are documented in the
 repository-level `README.md` and `SUBMISSION.md`.

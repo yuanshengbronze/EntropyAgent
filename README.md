@@ -173,7 +173,10 @@ For faster repeated runs, build the persistent concept-vector index once:
 python -m submission.src.precompute
 ```
 
-This creates `data/semantic_index.sqlite`. The agent also creates a catalog-fingerprinted `data/catalog_fts.sqlite` cache on first use. Both caches are generated artifacts and are automatically bypassed when incompatible with their source data or model.
+This creates `submission/assets/semantic_index.sqlite` by default. The agent
+also creates a catalog-fingerprinted `data/catalog_fts.sqlite` cache on first
+use. Both caches are generated artifacts and are automatically bypassed when
+incompatible with their source data or model.
 
 ## Agent Contract
 
@@ -231,7 +234,7 @@ All settings are optional environment variables.
 | `BM25_WEIGHTS`             | `0,4.5,4,2.5,2.5,1.5,1`                      | FTS5 weights for ID and six searchable fields.                                                               |
 | `CATALOG_FTS_PATH`         | beside catalog                               | Optional generated FTS cache path.                                                                           |
 | `CATALOG_ATTRIBUTES_PATH`  | `submission/assets/catalog_attributes.jsonl` | Structured attributes used for questions and constraints.                                                    |
-| `SEMANTIC_INDEX_PATH`      | `data/semantic_index.sqlite`                 | Optional persisted concept-vector index.                                                                     |
+| `SEMANTIC_INDEX_PATH`      | `submission/assets/semantic_index.sqlite`    | Optional persisted concept-vector index.                                                                     |
 
 ## Repository Layout
 

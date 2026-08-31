@@ -148,7 +148,9 @@ def main() -> None:
         help="Structured catalog JSONL to embed.",
     )
     parser.add_argument(
-        "--embedding-output", default="data/semantic_index.sqlite", help="Persistent semantic SQLite index."
+        "--embedding-output",
+        default="submission/assets/semantic_index.sqlite",
+        help="Persistent semantic SQLite index.",
     )
     parser.add_argument(
         "--embedding-model", default=os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text-v2-moe")
