@@ -16,7 +16,7 @@ is the default configuration.
 | Provided weak BM25 baseline  |       12.5% |       0.0680 |     9.810 |     0.1190 |          0.1067 |
 | **Our conversational agent** |   **98.5%** | **0.523732** | **3.455** | **0.7545** |     **0.80052** |
 
-Our system's performance remains the same for both LLM Enabled and LLM Disabled modes. Our use of local LLMs incurred **$0 in external API cost**. While enabling the LLM results in similar performance for this specific case, for cases where user queries are more vague it might increase the system's accuracy.
+Our system's performance remains similar for both LLM Enabled and LLM Disabled modes. Our use of local LLMs incurred **$0 in external API cost**. While enabling the LLM results in similar performance for this specific case, for cases where user queries are more vague it might increase the system's accuracy.
 
 ## Why It Stands Out
 
