@@ -11,3 +11,11 @@ Then pull the two local models:
 ollama pull llama3.2:3b
 ollama pull nomic-embed-text-v2-moe
 ```
+
+For faster repeated runs, build the persistent concept-vector index once:
+
+```bash
+python -m submission.src.precompute
+```
+
+This creates `submission/assets/semantic_index.sqlite` by default. You can also find it in this link: https://drive.google.com/drive/folders/11T1AaDDq86kXcEUuuVuU5xG3cshrw5fr?usp=sharing.

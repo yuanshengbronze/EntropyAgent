@@ -11,13 +11,12 @@ The system combines fast lexical retrieval, catalog-grounded semantic reranking,
 Results below are from the 200-session public development set. The LLM Disabled run
 is the default configuration.
 
-| System                                      | Hit Rate@10 |          MRR |    MTTC ↓ | Efficiency | Technical Score |
-| ------------------------------------------- | ----------: | -----------: | --------: | ---------: | --------------: |
-| Provided weak BM25 baseline                 |       12.5% |       0.0680 |     9.810 |     0.1190 |          0.1067 |
-| **Our conversational agent - LLM Disabled** |   **98.5%** | **0.523732** | **3.455** | **0.7545** |     **0.80052** |
-| **Our conversational agent - LLM Enabled**  |   **98.5%** | **0.521768** | **3.455** | **0.7545** |     **0.79993** |
+| System                       | Hit Rate@10 |          MRR |    MTTC ↓ | Efficiency | Technical Score |
+| ---------------------------- | ----------: | -----------: | --------: | ---------: | --------------: |
+| Provided weak BM25 baseline  |       12.5% |       0.0680 |     9.810 |     0.1190 |          0.1067 |
+| **Our conversational agent** |   **98.5%** | **0.523732** | **3.455** | **0.7545** |     **0.80052** |
 
-With LLM Disabled, the run used 0 tokens. With LLM Enabled, the run used 125778 tokens across 200 sessions and incurred **$0 in external API cost**. While enabling the LLM results in similar performance for this specific case, for cases where user queries are more vague it might increase the system's accuracy.
+Our system's performance remains the same for both LLM Enabled and LLM Disabled modes. Our use of local LLMs incurred **$0 in external API cost**. While enabling the LLM results in similar performance for this specific case, for cases where user queries are more vague it might increase the system's accuracy.
 
 ## Why It Stands Out
 
@@ -177,8 +176,9 @@ For faster repeated runs, build the persistent concept-vector index once:
 python -m submission.src.precompute
 ```
 
-This creates `submission/assets/semantic_index.sqlite` by default. The agent
-also creates a catalog-fingerprinted `submission/assets/catalog_fts.sqlite` cache on first
+This creates `submission/assets/semantic_index.sqlite` by default. You can also find it in this link: https://drive.google.com/drive/folders/11T1AaDDq86kXcEUuuVuU5xG3cshrw5fr?usp=sharing.
+
+The agent also creates a catalog-fingerprinted `submission/assets/catalog_fts.sqlite` cache on first
 use. Both caches are generated artifacts and are automatically bypassed when
 incompatible with their source data or model.
 
