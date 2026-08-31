@@ -15,9 +15,9 @@ is the default configuration.
 | ------------------------------------------- | ----------: | -----------: | --------: | ---------: | --------------: |
 | Provided weak BM25 baseline                 |       12.5% |       0.0680 |     9.810 |     0.1190 |          0.1067 |
 | **Our conversational agent - LLM Disabled** |   **98.5%** | **0.523732** | **3.455** | **0.7545** |     **0.80052** |
-| **Our conversational agent - LLM Enabled**  |   **97.5%** | **0.524583** | **3.435** | **0.7565** |    **0.796175** |
+| **Our conversational agent - LLM Enabled**  |   **98.5%** | **0.521768** | **3.455** | **0.7545** |     **0.79993** |
 
-With LLM Disabled, the run used 0 tokens. With LLM Enabled, the run used 270448 tokens across 200 sessions and incurred **$0 in external API cost**.
+With LLM Disabled, the run used 0 tokens. With LLM Enabled, the run used 125778 tokens across 200 sessions and incurred **$0 in external API cost**.
 
 ## Why It Stands Out
 
@@ -178,9 +178,12 @@ python -m submission.src.precompute
 ```
 
 This creates `submission/assets/semantic_index.sqlite` by default. The agent
-also creates a catalog-fingerprinted `data/catalog_fts.sqlite` cache on first
+also creates a catalog-fingerprinted `submission/assets/catalog_fts.sqlite` cache on first
 use. Both caches are generated artifacts and are automatically bypassed when
 incompatible with their source data or model.
+
+The precompute command reports the total embedding tokens used across its
+Ollama batches when the server provides `prompt_eval_count` usage metadata.
 
 ## Agent Contract
 
@@ -232,23 +235,23 @@ checked-in configuration.
 
 <!-- Keep this table in sync with SUBMISSION.md § Environment variables. -->
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `OLLAMA_ENABLED` | `0` | Set to `1` to opt into local Ollama; `0`, `false`, `no`, or unset selects the deterministic offline path. |
-| `OLLAMA_URL` | `http://localhost:11434` | Local Ollama base URL. |
-| `OLLAMA_MODEL` | `llama3.2:3b` | Catalog-constrained concept-selection model. |
-| `OLLAMA_EMBED_MODEL` | `nomic-embed-text-v2-moe` | Local embedding model and semantic-index identity. |
-| `OLLAMA_TIMEOUT` | `30` | Per-request timeout in seconds for the agent. The `extract_product_attributes` build script uses `120` when the variable is unset. |
-| `SEMANTIC_CANDIDATES` | `50` | Normal BM25 candidate-pool size. |
-| `OVERRIDE_CANDIDATES` | `150` | Candidate-pool size after an intent override. |
-| `SEMANTIC_CONFIDENCE_MARGIN` | `0.015` | Minimum top-vs-runner-up semantic-score separation before a rerank is trusted. |
-| `SEMANTIC_BLEND_WEIGHT` | `0.85` | Semantic contribution to a confident rerank. |
-| `SEMANTIC_EXPANSION_WEIGHT` | `0.20` | Contribution from model-selected concept expansions; `0` disables the LLM expansion call. |
-| `BM25_WEIGHTS` | `0,4.5,4,2.5,2.5,1.5,1` | Seven non-negative FTS5 column weights: `parent_asin` (unindexed), title, categories, features, details, store, description. |
-| `CATALOG_FTS_PATH` | beside catalog | Optional generated FTS cache path. |
-| `CATALOG_ATTRIBUTES_PATH` | `submission/assets/catalog_attributes.jsonl` | Structured attributes used for questions, constraints, and ratings. |
-| `CLEAN_CATALOG_PATH` | `submission/assets/catalog_attributes.jsonl` | Concept source for semantic retrieval (the same bundled file by default). |
-| `SEMANTIC_INDEX_PATH` | `submission/assets/semantic_index.sqlite` | Optional persisted concept-vector index (resolved beside `CLEAN_CATALOG_PATH`). |
+| Variable                     | Default                                      | Purpose                                                                                                                            |
+| ---------------------------- | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `OLLAMA_ENABLED`             | `0`                                          | Set to `1` to opt into local Ollama; `0`, `false`, `no`, or unset selects the deterministic offline path.                          |
+| `OLLAMA_URL`                 | `http://localhost:11434`                     | Local Ollama base URL.                                                                                                             |
+| `OLLAMA_MODEL`               | `llama3.2:3b`                                | Catalog-constrained concept-selection model.                                                                                       |
+| `OLLAMA_EMBED_MODEL`         | `nomic-embed-text-v2-moe`                    | Local embedding model and semantic-index identity.                                                                                 |
+| `OLLAMA_TIMEOUT`             | `30`                                         | Per-request timeout in seconds for the agent. The `extract_product_attributes` build script uses `120` when the variable is unset. |
+| `SEMANTIC_CANDIDATES`        | `50`                                         | Normal BM25 candidate-pool size.                                                                                                   |
+| `OVERRIDE_CANDIDATES`        | `150`                                        | Candidate-pool size after an intent override.                                                                                      |
+| `SEMANTIC_CONFIDENCE_MARGIN` | `0.015`                                      | Minimum top-vs-runner-up semantic-score separation before a rerank is trusted.                                                     |
+| `SEMANTIC_BLEND_WEIGHT`      | `0.85`                                       | Semantic contribution to a confident rerank.                                                                                       |
+| `SEMANTIC_EXPANSION_WEIGHT`  | `0.20`                                       | Contribution from model-selected concept expansions; `0` disables the LLM expansion call.                                          |
+| `BM25_WEIGHTS`               | `0,4.5,4,2.5,2.5,1.5,1`                      | Seven non-negative FTS5 column weights: `parent_asin` (unindexed), title, categories, features, details, store, description.       |
+| `CATALOG_FTS_PATH`           | `submission/assets/catalog_fts.sqlite`       | Optional generated FTS cache path.                                                                                                 |
+| `CATALOG_ATTRIBUTES_PATH`    | `submission/assets/catalog_attributes.jsonl` | Structured attributes used for questions, constraints, and ratings.                                                                |
+| `CLEAN_CATALOG_PATH`         | `submission/assets/catalog_attributes.jsonl` | Concept source for semantic retrieval (the same bundled file by default).                                                          |
+| `SEMANTIC_INDEX_PATH`        | `submission/assets/semantic_index.sqlite`    | Optional persisted concept-vector index (resolved beside `CLEAN_CATALOG_PATH`).                                                    |
 
 ## Repository Layout
 

@@ -31,11 +31,14 @@ def build_embedding_index(
     url: str,
     timeout: int,
     batch_size: int,
-) -> None:
+) -> int:
     """Create or resume an exact concept-vector index for runtime reranking.
 
     The exact concept strings used by ``Agent`` are embedded once globally.
     The SQLite file remains valid only for this source catalog and model.
+
+    Returns:
+        The total number of input tokens reported by Ollama for this run.
     """
     source_hash = file_sha256(input_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -86,6 +89,7 @@ def build_embedding_index(
     completed = int(connection.execute("SELECT COUNT(*) FROM concepts WHERE embedding IS NOT NULL").fetchone()[0])
     total = int(connection.execute("SELECT COUNT(*) FROM concepts").fetchone()[0])
     print(f"Catalog indexed: {indexed_products} products, {total} unique concepts ({completed} embedded).")
+    embedding_tokens = 0
     while True:
         rows = connection.execute(
             "SELECT concept FROM concepts WHERE embedding IS NULL ORDER BY concept LIMIT ?", (batch_size,)
@@ -98,6 +102,11 @@ def build_embedding_index(
         try:
             with urlopen(request, timeout=timeout) as response:
                 envelope = json.loads(response.read().decode("utf-8"))
+            try:
+                embedding_tokens += max(0, int(envelope.get("prompt_eval_count", 0)))
+            except (AttributeError, TypeError, ValueError):
+                # Some Ollama-compatible servers omit usage metadata.
+                pass
             vectors = envelope.get("embeddings")
             if not isinstance(vectors, list) or len(vectors) != len(concepts):
                 raise ValueError("unexpected embedding response")
@@ -117,9 +126,13 @@ def build_embedding_index(
             print(f"Embedded {completed}/{total} concepts.", flush=True)
         except (HTTPError, URLError, OSError, TimeoutError, TypeError, ValueError, json.JSONDecodeError) as exc:
             connection.close()
-            raise RuntimeError(f"Embedding failed after {completed}/{total} concepts: {exc}") from exc
+            raise RuntimeError(
+                f"Embedding failed after {completed}/{total} concepts and "
+                f"{embedding_tokens} embedding tokens: {exc}"
+            ) from exc
     connection.close()
-    print(f"Done. Wrote semantic index to {output_path}.")
+    print(f"Done. Wrote semantic index to {output_path}. Embedding tokens used: {embedding_tokens}.")
+    return embedding_tokens
 
 
 def _ollama_embed_url(url: str) -> str:

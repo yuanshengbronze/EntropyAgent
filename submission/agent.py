@@ -280,7 +280,7 @@ class Agent:
         cache_path = (
             Path(configured)
             if configured
-            else self.catalog_path.with_name("catalog_fts.sqlite")
+            else Path(__file__).with_name("assets") / "catalog_fts.sqlite"
         )
         fingerprint = file_sha256(self.catalog_path)
         if cache_path.exists():

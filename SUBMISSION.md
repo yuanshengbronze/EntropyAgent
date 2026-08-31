@@ -36,7 +36,7 @@ organizer documentation. In particular, exclude:
 
 ```text
 data/public_set.jsonl
-data/catalog_fts.sqlite
+submission/assets/catalog_fts.sqlite
 submission/assets/semantic_index.sqlite
 evaluator/
 tests/
@@ -69,7 +69,7 @@ by the agent and do not state a bundle-size limit; confirm the approximately
   `submission/requirements.txt` records that there are no third-party
   dependencies; running `pip install -r` therefore installs nothing.
 - SQLite must include FTS5 support, as it does in standard CPython builds.
-- Write access beside the catalog is optional. If unavailable, the agent builds
+- Write access to `submission/assets` is optional. If unavailable, the agent builds
   its FTS table in memory instead of writing `catalog_fts.sqlite`.
 
 For a deterministic run that makes no model or network request, set
@@ -142,8 +142,8 @@ Measurements below were taken on the current Windows development machine on
 - The recorded 200-session development run in `results.dev.json` reported
   18,292 prompt tokens and 2,313 completion tokens, or 20,605 total generation
   tokens (103.025 per session on average).
-- Offline fallback reports zero model tokens. Embedding token counts are not
-  included because the local Ollama embedding response does not expose them.
+- Offline fallback reports zero model tokens. `precompute.py` reports embedding
+  token usage when the local Ollama response includes `prompt_eval_count`.
 - Estimated external model/API cost is USD 0.00 for the intended local Ollama
   configuration and the offline fallback. This estimate excludes local
   hardware, electricity, model-download bandwidth, and setup time. If
@@ -205,7 +205,7 @@ All variables are optional; the defaults reproduce the checked-in configuration.
 | `SEMANTIC_BLEND_WEIGHT` | `0.85` | Semantic contribution to a confident rerank. |
 | `SEMANTIC_EXPANSION_WEIGHT` | `0.20` | Contribution from model-selected concept expansions; `0` disables the LLM expansion call. |
 | `BM25_WEIGHTS` | `0,4.5,4,2.5,2.5,1.5,1` | Seven non-negative FTS5 column weights: `parent_asin` (unindexed), title, categories, features, details, store, description. |
-| `CATALOG_FTS_PATH` | beside catalog | Optional generated FTS cache path. |
+| `CATALOG_FTS_PATH` | `submission/assets/catalog_fts.sqlite` | Optional generated FTS cache path. |
 | `CATALOG_ATTRIBUTES_PATH` | `submission/assets/catalog_attributes.jsonl` | Structured attributes used for questions, constraints, and ratings. |
 | `CLEAN_CATALOG_PATH` | `submission/assets/catalog_attributes.jsonl` | Concept source for semantic retrieval (the same bundled file by default). |
 | `SEMANTIC_INDEX_PATH` | `submission/assets/semantic_index.sqlite` | Optional persisted concept-vector index (resolved beside `CLEAN_CATALOG_PATH`). |
