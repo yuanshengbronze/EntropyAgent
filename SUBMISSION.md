@@ -137,8 +137,8 @@ Measurements below were taken on the current Windows development machine on
 2026-08-30 with warm generated retrieval caches:
 
 - Offline demonstration (`python -m submission.demo`, `OLLAMA_ENABLED=0`): agent
-  initialization plus four conversational turns completed in 3.107 seconds
-  wall-clock.
+  initialization plus a full simulated clarification dialogue completed in
+  roughly 3 seconds wall-clock.
 - The recorded 200-session development run in `results.dev.json` reported
   18,292 prompt tokens and 2,313 completion tokens, or 20,605 total generation
   tokens (103.025 per session on average).
