@@ -1,2 +1,13 @@
 # No third-party Python packages are required.
 # Runtime: CPython 3.10+ with SQLite FTS5 support.
+
+To enable LLM-powered search:
+Install Ollama from [ollama.com/download](https://ollama.com/download), or on
+Linux with `curl -fsSL https://ollama.com/install.sh | sh`, and ensure the
+service is running (`ollama serve`; the desktop app starts it automatically).
+Then pull the two local models:
+
+```bash
+ollama pull llama3.2:3b
+ollama pull nomic-embed-text-v2-moe
+```
