@@ -8,23 +8,16 @@ The system combines fast lexical retrieval, catalog-grounded semantic reranking,
 
 ## Results at a Glance
 
-Results below are from the 200-session public development set. They are development measurements, not private-leaderboard claims.
+Results below are from the 200-session public development set. The Ollama-off run
+is the default configuration.
 
-| System | Hit Rate@10 | MRR | MTTC ↓ | Efficiency | Technical Score |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Provided weak BM25 baseline | 12.5% | 0.0680 | 9.810 | 0.1190 | 0.1067 |
-| **Our conversational agent** | **98.5%** | **0.5025** | **3.415** | **0.7585** | **0.7950** |
+| System                                      | Hit Rate@10 |          MRR |    MTTC ↓ | Efficiency | Technical Score |
+| ------------------------------------------- | ----------: | -----------: | --------: | ---------: | --------------: |
+| Provided weak BM25 baseline                 |       12.5% |       0.0680 |     9.810 |     0.1190 |          0.1067 |
+| **Our conversational agent - LLM Disabled** |   **98.5%** | **0.523732** | **3.455** | **0.7545** |     **0.80052** |
+| **Our conversational agent - LLM Enabled**  |   **97.5%** | **0.524583** | **3.435** | **0.7565** |    **0.796175** |
 
-Performance by scenario:
-
-| Scenario | Sessions | Hit Rate@10 | MRR | MTTC ↓ |
-| --- | ---: | ---: | ---: | ---: |
-| Buying | 80 | 98.75% | 0.5259 | 2.813 |
-| Browsing | 80 | 100.00% | 0.5071 | 3.013 |
-| Intent Override | 30 | 96.67% | 0.4693 | 5.600 |
-| Boundary | 10 | 90.00% | 0.3789 | 4.900 |
-
-The saved development run used 20,605 local generation tokens across 200 sessions (about 103 tokens per session) and incurred **$0 in external API cost**.
+With LLM Disabled, the run used 0 tokens. With LLM Enabled, the run used 270448 tokens across 200 sessions and incurred **$0 in external API cost**.
 
 ## Why It Stands Out
 
@@ -80,15 +73,19 @@ development tools distributed by the organizer; they are not needed by the
 agent at runtime and are not part of this repository.
 
 The submission includes `submission/assets/catalog_attributes.jsonl`, a
-deterministically derived representation of the frozen catalog. To reproduce or
-refresh it from the organizer-provided raw catalog without an LLM or network
-service, run:
+catalog-derived representation of the frozen catalog. To reproduce or refresh
+it from the organizer-provided raw catalog, run:
 
 ```bash
 python -m submission.src.extract_product_attributes \
   --input data/catalog.jsonl \
   --output submission/assets/catalog_attributes.jsonl
 ```
+
+With `OLLAMA_ENABLED=0` (the default), this uses the deterministic parser for
+catalog-grounded extraction. Set `OLLAMA_ENABLED=1` to opt into the configured
+local Ollama model. If Ollama cannot serve a request, it falls back to the
+deterministic parser. Both paths produce the same output schema.
 
 This bundled asset enables adaptive questions, answer grounding, constraint and
 rating reranking, and catalog-grounded semantic concepts. It contains product
@@ -97,9 +94,9 @@ private evaluation data, user data, or credentials.
 
 ### Run the deterministic offline agent
 
-The official harness imports `Agent` directly. To force the network-free,
-deterministic path, set `OLLAMA_ENABLED=0` in the evaluation environment before
-starting that harness.
+The official harness imports `Agent` directly. The network-free deterministic
+path is the default. To explicitly select it, set `OLLAMA_ENABLED=0` in the
+evaluation environment before starting that harness.
 
 PowerShell:
 
@@ -161,31 +158,22 @@ Keeping `catalog_attributes.jsonl` is deliberate: even if semantic embeddings ca
 
 ### Enable local semantic reranking
 
-The optional semantic path uses Ollama on `http://localhost:11434` by default:
+The optional semantic path uses Ollama on `http://localhost:11434` when enabled:
 
 ```bash
 ollama pull llama3.2:3b
 ollama pull nomic-embed-text-v2-moe
 ```
 
-Then start the organizer's harness with `OLLAMA_ENABLED=1` (the default).
+Then start the organizer's harness with `OLLAMA_ENABLED=1` to opt in.
 
 For faster repeated runs, build the persistent concept-vector index once:
 
 ```bash
-python -m submission.src.precompute --build-embeddings
+python -m submission.src.precompute
 ```
 
 This creates `data/semantic_index.sqlite`. The agent also creates a catalog-fingerprinted `data/catalog_fts.sqlite` cache on first use. Both caches are generated artifacts and are automatically bypassed when incompatible with their source data or model.
-
-### Run the conversational smoke check
-
-The repository includes a catalog-only smoke check that does not use the
-public development sessions or evaluator:
-
-```bash
-OLLAMA_ENABLED=0 python smoke_check.py
-```
 
 ## Agent Contract
 
@@ -229,20 +217,21 @@ Technical Score = 0.50 × Hit Rate@10 + 0.30 × MRR + 0.20 × Efficiency
 
 All settings are optional environment variables.
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `OLLAMA_ENABLED` | `1` | Set to `0` for immediate deterministic offline mode. |
-| `OLLAMA_URL` | `http://localhost:11434` | Local Ollama base URL. |
-| `OLLAMA_MODEL` | `llama3.2:3b` | Catalog-constrained concept-selection model. |
-| `OLLAMA_EMBED_MODEL` | `nomic-embed-text-v2-moe` | Local embedding model. |
-| `OLLAMA_TIMEOUT` | `30` | Per-request timeout in seconds. |
-| `SEMANTIC_RERANK_ENABLED` | `1` | Enable or disable semantic reranking. |
-| `SEMANTIC_CANDIDATES` | `50` | Normal BM25 candidate-pool size. |
-| `OVERRIDE_CANDIDATES` | `150` | Candidate-pool size after an intent override. |
-| `BM25_WEIGHTS` | `0,4.5,4,2.5,2.5,1.5,1` | FTS5 weights for ID and six searchable fields. |
-| `CATALOG_FTS_PATH` | beside catalog | Optional generated FTS cache path. |
-| `CATALOG_ATTRIBUTES_PATH` | `submission/assets/catalog_attributes.jsonl` | Structured attributes used for questions and constraints. |
-| `SEMANTIC_INDEX_PATH` | `data/semantic_index.sqlite` | Optional persisted concept-vector index. |
+| Variable                   | Default                                      | Purpose                                                                                                      |
+| -------------------------- | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `OLLAMA_ENABLED`           | `0`                                          | Set to `1` to opt into local Ollama; otherwise use immediate deterministic offline mode.                     |
+| `OLLAMA_URL`               | `http://localhost:11434`                     | Local Ollama base URL.                                                                                       |
+| `OLLAMA_MODEL`             | `llama3.2:3b`                                | Catalog-constrained concept-selection model.                                                                 |
+| `OLLAMA_EMBED_MODEL`       | `nomic-embed-text-v2-moe`                    | Local embedding model.                                                                                       |
+| `OLLAMA_TIMEOUT`           | `30`                                         | Per-request timeout in seconds.                                                                              |
+| `SEMANTIC_RERANK_ENABLED`  | `1`                                          | Enable or disable semantic reranking.                                                                        |
+| `ANSWER_GROUNDING_ENABLED` | `1`                                          | Set to `0`, `false`, or `no` to skip clarification-answer grounding; answers remain ordinary query evidence. |
+| `SEMANTIC_CANDIDATES`      | `50`                                         | Normal BM25 candidate-pool size.                                                                             |
+| `OVERRIDE_CANDIDATES`      | `150`                                        | Candidate-pool size after an intent override.                                                                |
+| `BM25_WEIGHTS`             | `0,4.5,4,2.5,2.5,1.5,1`                      | FTS5 weights for ID and six searchable fields.                                                               |
+| `CATALOG_FTS_PATH`         | beside catalog                               | Optional generated FTS cache path.                                                                           |
+| `CATALOG_ATTRIBUTES_PATH`  | `submission/assets/catalog_attributes.jsonl` | Structured attributes used for questions and constraints.                                                    |
+| `SEMANTIC_INDEX_PATH`      | `data/semantic_index.sqlite`                 | Optional persisted concept-vector index.                                                                     |
 
 ## Repository Layout
 
@@ -264,10 +253,10 @@ submission/
     catalog_attributes.jsonl  bundled catalog-derived runtime attributes
   src/
     __init__.py
-    extract_product_attributes.py deterministic attribute extractor
+    extract_product_attributes.py Ollama-or-deterministic attribute extractor
     question_selection.py     entropy and answer-grounding logic
     semantic_index.py         concept and index utilities
-    precompute.py             optional catalog/index preprocessing
+    precompute.py             optional semantic-index preprocessing
 ```
 
 Not included in the submission repository:

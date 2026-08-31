@@ -260,13 +260,11 @@ class Agent:
         self.llm_model = os.environ.get("OLLAMA_MODEL", "llama3.2:3b")
         self.embedding_model = os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text-v2-moe")
         self.ollama_timeout = int(os.environ.get("OLLAMA_TIMEOUT", "30"))
-        self._llm_available = os.environ.get("OLLAMA_ENABLED", "1").lower() not in {
+        self.ollama_enabled = os.environ.get("OLLAMA_ENABLED", "0").lower() not in {
             "0", "false", "no",
         }
+        self._llm_available = self.ollama_enabled
         self._embedding_available = self._llm_available
-        self.semantic_rerank_enabled = (
-            os.environ.get("SEMANTIC_RERANK_ENABLED", "1").lower() not in {"0", "false", "no"}
-        )
         self.attributes_by_asin: dict[str, dict] = {}
         self.attribute_values: dict[str, set[str]] = {
             attribute: set() for attribute in ASKABLE_ATTRIBUTES
@@ -347,7 +345,7 @@ class Agent:
         connection.commit()
 
     def _load_semantic_index(self) -> None:
-        """Load offline LLM features, if precompute.py has generated them."""
+        """Load structured concepts and an optional persisted embedding index."""
         configured = os.environ.get("CLEAN_CATALOG_PATH")
         if configured:
             clean_path = Path(configured)
@@ -359,16 +357,17 @@ class Agent:
                 else self.catalog_path.with_name("catalog_attributes.jsonl")
             )
             if not clean_path.exists():
-                # Lazily create the flat semantic catalog on first use.  This
-                # keeps normal runs fast while allowing a raw catalog to work
-                # without a separate manual preprocessing command.
-                precompute = Path(__file__).with_name("src") / "precompute.py"
-                if precompute.exists():
+                # Lazily create the flat attribute catalog on first use.  The
+                # extractor chooses local Ollama when enabled and otherwise
+                # uses its deterministic parser, so raw catalogs work without
+                # a separate manual preprocessing command.
+                extractor = Path(__file__).with_name("src") / "extract_product_attributes.py"
+                if extractor.exists():
                     try:
                         subprocess.run(
                             [
                                 sys.executable,
-                                str(precompute),
+                                str(extractor),
                                 "--input", str(self.catalog_path),
                                 "--output", str(clean_path),
                             ],
@@ -514,7 +513,11 @@ class Agent:
             self._llm_available = False
             return None, {"prompt_tokens": 0, "completion_tokens": 0}
 
-    def _embed(self, texts: list[str]) -> dict[str, list[float]] | None:
+    def _embed(
+        self,
+        texts: list[str],
+        usage: dict[str, int] | None = None,
+    ) -> dict[str, list[float]] | None:
         """Resolve persisted vectors first, embedding only genuinely new text."""
         self._load_persisted_embeddings(texts)
         missing = list(dict.fromkeys(text for text in texts if text not in self.embedding_cache))
@@ -530,6 +533,14 @@ class Agent:
                 envelope = self._ollama_request(
                     "embed", {"model": self.embedding_model, "input": batch}
                 )
+                try:
+                    embedding_prompt_tokens = max(
+                        0, int(envelope.get("prompt_eval_count", 0))
+                    )
+                except (TypeError, ValueError):
+                    embedding_prompt_tokens = 0
+                if usage is not None:
+                    usage["prompt_tokens"] += embedding_prompt_tokens
                 vectors = envelope.get("embeddings")
                 if not isinstance(vectors, list) or len(vectors) != len(batch):
                     raise ValueError("unexpected embedding response")
@@ -612,6 +623,7 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
         direct_queries: list[tuple[str, float]],
         query_concepts: list[str],
         rows: list[tuple[str, float]],
+        usage: dict[str, int] | None = None,
     ) -> list[float] | None:
         direct_queries = [(query, weight) for query, weight in direct_queries if weight > 0.0]
         if not direct_queries:
@@ -622,7 +634,9 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
             for concept in self.concepts_by_asin.get(parent_asin, [])
             if _informative_concept(concept)
         ))
-        embeddings = self._embed([*direct_texts, *query_concepts, *document_concepts])
+        embeddings = self._embed(
+            [*direct_texts, *query_concepts, *document_concepts], usage
+        )
         if embeddings is None or any(query not in embeddings for query in direct_texts):
             return None
         # Normalizing once avoids recalculating two vector norms for every
@@ -881,7 +895,13 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
             return choose_next_question(pool, exhausted), utility
         return attribute, utility
 
-    def _ground_answer(self, session: dict, answer: str, attribute: str) -> bool:
+    def _ground_answer(
+        self,
+        session: dict,
+        answer: str,
+        attribute: str,
+        usage: dict[str, int] | None = None,
+    ) -> bool:
         """Map a free-text answer to curated catalog values and record the slot."""
         if not self.attributes_by_asin or not session["last_candidates"]:
             return False
@@ -893,8 +913,9 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
         if not pool:
             return False
         embed_fn = (
-            self._embed
-            if self._embedding_available or self._semantic_connection is not None
+            (lambda texts: self._embed(texts, usage))
+            if self.ollama_enabled
+            and (self._embedding_available or self._semantic_connection is not None)
             else None
         )
         grounded = ground_answer(answer, attribute, pool, embed_fn=embed_fn)
@@ -1166,6 +1187,7 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
         if session_id not in self._sessions:
             raise RuntimeError("reset must be called before respond")
         session = self._sessions[session_id]
+        usage = {"prompt_tokens": 0, "completion_tokens": 0}
         shown_parent_asins: set[str] = session["shown_parent_asins"]
         if session["route"] is None:
             session["route"] = self._detect_route(user_message)
@@ -1186,8 +1208,9 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
         elif pending_attribute and not is_override_message:
             # An override answers the shopper's old question only accidentally;
             # it must reset state before any old slot can be confirmed.
-            grounded_changed = self._ground_answer(session, user_message, pending_attribute)
-        usage = {"prompt_tokens": 0, "completion_tokens": 0}
+            grounded_changed = self._ground_answer(
+                session, user_message, pending_attribute, usage
+            )
         evidence: dict[str, str]
         diagnostics = {
             "turn": turn,
@@ -1247,7 +1270,7 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
             # conversation adds evidence. This includes Buying turns and the
             # first response after an Intent Override, not just early Browsing.
             should_semantic_rerank = (
-                self.semantic_rerank_enabled
+                self.ollama_enabled
                 and bool(rows)
                 and (
                     turn <= 2
@@ -1264,12 +1287,16 @@ Candidate concepts: {json.dumps(candidates, ensure_ascii=False)}"""
                 direct_queries = self._direct_semantic_queries(session)
                 query_concepts: list[str] = []
                 if candidate_concepts and SEMANTIC_EXPANSION_WEIGHT > 0.0:
-                    query_concepts, usage = self._select_query_concepts(
+                    query_concepts, generation_usage = self._select_query_concepts(
                         conversation, candidate_concepts
                     )
+                    usage["prompt_tokens"] += generation_usage["prompt_tokens"]
+                    usage["completion_tokens"] += generation_usage["completion_tokens"]
                 diagnostics["semantic_direct_queries"] = len(direct_queries)
                 diagnostics["semantic_expansions"] = len(query_concepts)
-                semantic_scores = self._semantic_scores(direct_queries, query_concepts, rows)
+                semantic_scores = self._semantic_scores(
+                    direct_queries, query_concepts, rows, usage
+                )
                 if semantic_scores is not None:
                     diagnostics["semantic_confident"] = self._semantic_is_confident(
                         semantic_scores

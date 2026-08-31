@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Extract normalized matching attributes from the frozen product catalog.
+"""Build normalized product attributes from the frozen product catalog.
 
-The extractor is intentionally conservative: it only emits values found in explicit
-detail fields or recognized in product copy. It uses only the Python standard library
-so the full catalog can be processed reproducibly without API calls.
+When ``OLLAMA_ENABLED`` is true, the extractor asks the configured local Ollama
+model for short, catalog-grounded attributes. Ollama is disabled by default; if
+it is disabled or cannot serve a request, the extractor uses the conservative
+rule-based parser below instead. Both paths write the same
+``catalog_attributes.jsonl`` schema.
 """
 
 from __future__ import annotations
@@ -12,11 +14,35 @@ import argparse
 import json
 import os
 import re
+import sys
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 
 UNKNOWN = "unknown"
+OLLAMA_DISABLED_VALUES = {"0", "false", "no"}
+
+# ``null`` is a valid absence of an attribute in the Agent API, but it is not
+# useful as a JSON object key.  The local model must select from this fixed
+# vocabulary so its output stays compatible with the deterministic parser.
+LLM_ATTRIBUTE_KEYS = (
+    "material",
+    "color",
+    "size",
+    "style",
+    "brand",
+    "budget",
+    "feature",
+    "use_case",
+    "other",
+)
+
+
+class OllamaExtractionError(RuntimeError):
+    """Raised when a local Ollama extraction response cannot be used."""
 
 
 MATERIAL_PATTERNS = [
@@ -561,7 +587,8 @@ def extract_other(product: dict) -> str:
     return joined(result, separator="; ", limit=8)
 
 
-def extract(product: dict) -> dict:
+def extract_deterministic(product: dict) -> dict:
+    """Extract attributes with the conservative, no-model parser."""
     price = product.get("price")
     return {
         "parent_asin": product.get("parent_asin") or UNKNOWN,
@@ -581,7 +608,191 @@ def extract(product: dict) -> dict:
     }
 
 
-def process(input_path: Path, output_path: Path, limit: int | None = None) -> int:
+def _strings(value: Any) -> list[str]:
+    """Flatten catalog values into compact, human-readable strings."""
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        return [f"{key}: {item}" for key, item in value.items() if item not in (None, "", [])]
+    if isinstance(value, list):
+        return [str(item) for item in value if item not in (None, "")]
+    return [str(value)] if value != "" else []
+
+
+def _compact_record(product: dict[str, Any], max_chars: int = 5_000) -> str:
+    """Keep an extraction prompt bounded while retaining useful source fields."""
+    fields = (
+        ("title", product.get("title")),
+        ("categories", product.get("categories", product.get("category"))),
+        ("brand/store", product.get("store")),
+        ("price", product.get("price")),
+        ("features", product.get("features")),
+        ("details", product.get("details")),
+        ("description", product.get("description")),
+    )
+    parts: list[str] = []
+    remaining = max_chars
+    for name, value in fields:
+        values = _strings(value)
+        if not values or remaining <= 0:
+            continue
+        text = f"{name}: " + " | ".join(values)
+        parts.append(text[:remaining])
+        remaining -= len(text) + 1
+    return "\n".join(parts)
+
+
+def _llm_prompt(product: dict[str, Any]) -> str:
+    return f"""You are building a trustworthy product-search index.
+Extract short product attributes from the supplied catalog record.
+
+Use only these attribute keys: {", ".join(LLM_ATTRIBUTE_KEYS)}.
+Return JSON only: an object mapping each applicable key to a list of short
+evidence phrases. Omit inapplicable keys. Do not include category; it is
+preserved separately from the catalog. Use `other` only for useful evidence
+that fits none of the named keys.
+
+Rules:
+- Select and extract only facts supported by the record; never guess.
+- Preserve important wording (for example, material names, color names, fit,
+  brand, price, or use case) instead of writing a marketing summary.
+- Each phrase must be at most 80 characters. At most 6 phrases per key.
+- Do not output product IDs, explanations, markdown, or a `null` key.
+
+Catalog record:
+{_compact_record(product)}
+"""
+
+
+def _ollama_generate_url(url: str) -> str:
+    """Accept either Ollama's base URL or its explicit generate endpoint."""
+    base = url.rstrip("/")
+    return base if base.endswith("/api/generate") else f"{base}/api/generate"
+
+
+def _ollama_extract(product: dict[str, Any], model: str, url: str, timeout: int) -> dict[str, Any]:
+    """Run one constrained extraction call against the local Ollama server."""
+    payload = json.dumps({
+        "model": model,
+        "prompt": _llm_prompt(product),
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0},
+    }).encode("utf-8")
+    request = Request(
+        _ollama_generate_url(url), data=payload, headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            envelope = json.loads(response.read().decode("utf-8"))
+        answer = json.loads(envelope["response"])
+    except (HTTPError, URLError, OSError, TimeoutError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise OllamaExtractionError(
+            f"Ollama extraction failed for {product.get('parent_asin', '<unknown>')}: {exc}"
+        ) from exc
+    if not isinstance(answer, dict):
+        raise OllamaExtractionError("Ollama returned JSON that was not an object")
+    return answer
+
+
+def _clean_llm_values(value: Any) -> list[str]:
+    candidates = value if isinstance(value, list) else [value]
+    values: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        cleaned = " ".join(candidate.split()).strip(" -,:;.")[:80]
+        key = cleaned.casefold()
+        if cleaned and key not in seen:
+            seen.add(key)
+            values.append(cleaned)
+        if len(values) == 6:
+            break
+    return values
+
+
+def extract_with_ollama(product: dict[str, Any], model: str, url: str, timeout: int) -> dict:
+    """Extract catalog-grounded attributes with Ollama in the shared output schema."""
+    extracted = _ollama_extract(product, model, url, timeout)
+    features = {
+        key: values
+        for key in LLM_ATTRIBUTE_KEYS
+        if (values := _clean_llm_values(extracted.get(key)))
+    }
+
+    def first(key: str, default: Any = UNKNOWN) -> Any:
+        values = features.get(key)
+        return ", ".join(values) if values else default
+
+    # Category is copied from the catalog rather than generated by the model.
+    # This keeps the LLM from changing an important retrieval boundary.
+    return {
+        "parent_asin": product.get("parent_asin") or UNKNOWN,
+        "title": product.get("title") or UNKNOWN,
+        "category": product.get("categories", product.get("category")) or UNKNOWN,
+        "materials": first("material"),
+        "color": first("color"),
+        "size": first("size"),
+        "style": first("style"),
+        "brand": first("brand"),
+        "budget_price": first("budget"),
+        "feature": first("feature"),
+        "use_case": first("use_case"),
+        "average_rating": product.get("average_rating") if product.get("average_rating") is not None else UNKNOWN,
+        "rating_number": product.get("rating_number") if product.get("rating_number") is not None else UNKNOWN,
+        "other": first("other"),
+    }
+
+
+def ollama_enabled() -> bool:
+    return os.environ.get("OLLAMA_ENABLED", "0").lower() not in OLLAMA_DISABLED_VALUES
+
+
+def extract(
+    product: dict,
+    *,
+    use_ollama: bool | None = None,
+    model: str | None = None,
+    url: str | None = None,
+    timeout: int | None = None,
+) -> dict:
+    """Use the local model when enabled, with deterministic failure fallback."""
+    if use_ollama is None:
+        use_ollama = ollama_enabled()
+    if not use_ollama:
+        return extract_deterministic(product)
+    try:
+        return extract_with_ollama(
+            product,
+            model or os.environ.get("OLLAMA_MODEL", "llama3.2:3b"),
+            url or os.environ.get("OLLAMA_URL", "http://localhost:11434"),
+            timeout or int(os.environ.get("OLLAMA_TIMEOUT", "120")),
+        )
+    except OllamaExtractionError:
+        return extract_deterministic(product)
+
+
+def process(
+    input_path: Path,
+    output_path: Path,
+    limit: int | None = None,
+    *,
+    use_ollama: bool | None = None,
+    model: str | None = None,
+    url: str | None = None,
+    timeout: int | None = None,
+) -> int:
+    """Write one normalized record per source product.
+
+    Once a local model request fails, processing continues entirely with the
+    deterministic parser. This avoids a timeout for every remaining product.
+    """
+    if use_ollama is None:
+        use_ollama = ollama_enabled()
+    model = model or os.environ.get("OLLAMA_MODEL", "llama3.2:3b")
+    url = url or os.environ.get("OLLAMA_URL", "http://localhost:11434")
+    timeout = timeout or int(os.environ.get("OLLAMA_TIMEOUT", "120"))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp")
     count = 0
@@ -594,7 +805,16 @@ def process(input_path: Path, output_path: Path, limit: int | None = None) -> in
                     product = json.loads(line)
                 except json.JSONDecodeError as exc:
                     raise ValueError(f"Invalid JSON on input line {line_number}: {exc}") from exc
-                destination.write(json.dumps(extract(product), ensure_ascii=False, separators=(",", ":")) + "\n")
+                if use_ollama:
+                    try:
+                        row = extract_with_ollama(product, model, url, timeout)
+                    except OllamaExtractionError as exc:
+                        use_ollama = False
+                        print(f"{exc}; using deterministic extraction for the remaining records.", file=sys.stderr)
+                        row = extract_deterministic(product)
+                else:
+                    row = extract_deterministic(product)
+                destination.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
                 count += 1
                 if limit is not None and count >= limit:
                     break
@@ -614,8 +834,33 @@ def main() -> None:
         default=Path("submission/assets/catalog_attributes.jsonl"),
     )
     parser.add_argument("--limit", type=int, help="Process only the first N records (for validation).")
+    parser.add_argument("--model", default=os.environ.get("OLLAMA_MODEL", "llama3.2:3b"))
+    parser.add_argument("--ollama-url", default=os.environ.get("OLLAMA_URL", "http://localhost:11434"))
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=int(os.environ.get("OLLAMA_TIMEOUT", "120")),
+        help="Seconds allowed for one Ollama extraction request.",
+    )
+    parser.add_argument(
+        "--no-ollama",
+        action="store_true",
+        help="Force the deterministic parser, regardless of OLLAMA_ENABLED.",
+    )
     args = parser.parse_args()
-    count = process(args.input, args.output, args.limit)
+    if args.limit is not None and args.limit < 0:
+        parser.error("--limit must be non-negative")
+    if args.timeout <= 0:
+        parser.error("--timeout must be positive")
+    count = process(
+        args.input,
+        args.output,
+        args.limit,
+        use_ollama=ollama_enabled() and not args.no_ollama,
+        model=args.model,
+        url=args.ollama_url,
+        timeout=args.timeout,
+    )
     print(f"Wrote {count:,} records to {args.output}")
 
 
