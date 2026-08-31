@@ -116,27 +116,42 @@ API, so estimated external model cost is USD 0.00.
 
 ## Demonstrated multi-turn session
 
-`python -m submission.demo` replays a short offline conversation through the
-agent with `OLLAMA_ENABLED=0`. It reads the organizer catalog at
-`data/catalog.jsonl` (override with `--catalog PATH`) and reports zero model
-tokens. An abbreviated run:
+`python -m submission.demo` runs a hidden **intent card** through a simulated
+customer against the agent (`OLLAMA_ENABLED=0`, zero model tokens). The agent
+never sees the card; it recovers the shopper's intent through its own clarifying
+questions, and each turn reports where the hidden target sits in the ranking.
+The card fixes the target product, the category, a disclosed requirement, and
+the private preferences the customer reveals only when asked:
+
+```python
+INTENT_CARD = {
+    "target_parent_asin": "B07TGH64XN",
+    "category": "men's rain jacket",
+    "route": "buying",                       # discloses a key requirement up front
+    "requirement": "waterproof",
+    "preferences": {"feature": ["breathable"]},
+}
+```
+
+It reads the organizer catalog at `data/catalog.jsonl` (override with
+`--catalog PATH`). An abbreviated run — the agent's question order, the target
+rank, and the product IDs come from one run against the frozen catalog:
 
 ```text
-User:  I need a men's rain jacket. A key requirement is: waterproof.
+User:  I'm looking for a men's rain jacket. A key requirement is: waterproof.
 Agent: I found some close matches. Any preference on feature?
        Top result: B07TGH64XN
+       Target B07TGH64XN: rank 1
 
-User:  For that, what matters is: sealed seams; packable.
+User:  For that, what matters is: breathable.
 Agent: I found some close matches. Any preference on material?
        Top result: B07QS6GYN6
-
-User:  I'd like it in navy.
-Agent: I found some close matches. Any preference on style?
-       Top result: B071W1LMX7
+       Target B07TGH64XN: rank 2
 
 User:  I don't have a preference for that; use your judgment.
-Agent: I found some close matches. Any preference on use case?
-       Top result: B0089Q0XBS
+Agent: I found some close matches. Any preference on style?
+       Top result: B07TGH64XN
+       Target B07TGH64XN: rank 1
 ```
 
 ## Known limitations
