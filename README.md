@@ -1,4 +1,4 @@
-# TechJam Conversational E-Commerce Search
+# EntropyAgent
 
 > A multi-turn shopping agent that turns vague requests into precise, ranked product recommendations—without sending customer data to a hosted service.
 
